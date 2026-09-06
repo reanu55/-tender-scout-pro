@@ -1,0 +1,4 @@
+id,titel,auftraggeber,frist,auftragswert,beschreibung,url
+DEMO-001,Lieferung von Kabeln und Adaptern,Kommunaler IT-Dienstleister,2026-10-15,1800,Lieferung verschiedener Netzwerkkabel Adapter und Zubehör,https://example.com/tender/1
+DEMO-002,Rahmenvertrag Werkstattbedarf,Stadtbetrieb,2026-10-30,6500,Werkzeug Verbrauchsmaterial und Befestigungstechnik; Referenzen erforderlich,https://example.com/tender/2
+DEMO-003,Lieferung sicherheitskritischer Spezialausrüstung,Bundesbehörde,2026-09-20,25000,Sicherheitsüberprüfung und Bankbürgschaft erforderlich,https://example.com/tender/3
