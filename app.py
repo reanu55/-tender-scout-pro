@@ -1,907 +1,453 @@
+import io
 import json
 import math
 import re
 import sqlite3
-from datetime import date, datetime
+import zipfile
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
+import xml.etree.ElementTree as ET
 
 import pandas as pd
 import requests
 import streamlit as st
 
-# ============================================================
-# Tender Scout Pro 2.0
-# Mobile-first procurement opportunity scanner for ordinary B2B goods.
-# ============================================================
-
+APP_VERSION = "PRO 1.0"
 APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "tenders.db"
+DB_PATH = APP_DIR / "tender_scout.db"
 TED_SEARCH_URL = "https://api.ted.europa.eu/v3/notices/search"
-APP_VERSION = "2.0.0"
 
-st.set_page_config(
-    page_title="Tender Scout Pro",
-    page_icon="📦",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(page_title="Tender Scout Pro", page_icon="📦", layout="wide", initial_sidebar_state="collapsed")
 
-st.markdown(
-    """
+st.markdown(r"""
 <style>
-.block-container {padding-top: .75rem; padding-bottom: 5rem; max-width: 1180px;}
-[data-testid="stMetricValue"] {font-size: 1.45rem;}
-div.stButton > button, div.stLinkButton > a {min-height: 3rem; border-radius: 13px; font-weight: 700;}
-div[data-testid="stExpander"] {border-radius: 14px;}
-.tsp-card {border:1px solid rgba(128,128,128,.28); border-radius:18px; padding:16px; margin:10px 0;}
-.tsp-muted {opacity:.72; font-size:.9rem;}
-.tsp-badge {display:inline-block; padding:4px 9px; border-radius:999px; border:1px solid rgba(128,128,128,.28); margin:2px 4px 2px 0; font-size:.82rem;}
-@media (max-width: 700px) {
-  .block-container {padding-left:.75rem; padding-right:.75rem;}
-  h1 {font-size:1.8rem !important;}
-  h2 {font-size:1.35rem !important;}
-  h3 {font-size:1.15rem !important;}
-}
+:root { --radius:18px; }
+.block-container {max-width:1180px; padding-top:.7rem; padding-bottom:5rem;}
+header[data-testid="stHeader"] {background:rgba(0,0,0,0);}
+[data-testid="stMetric"] {border:1px solid rgba(128,128,128,.23); border-radius:16px; padding:12px 14px;}
+[data-testid="stMetricValue"] {font-size:1.45rem;}
+div.stButton > button, div.stLinkButton > a {min-height:3rem; border-radius:14px; font-weight:750;}
+div[data-testid="stExpander"] {border-radius:16px; border:1px solid rgba(128,128,128,.22);}
+.tsp-hero {border:1px solid rgba(128,128,128,.24); border-radius:22px; padding:20px; margin-bottom:14px; background:linear-gradient(135deg,rgba(212,170,65,.12),rgba(40,80,160,.08));}
+.tsp-card {border:1px solid rgba(128,128,128,.24); border-radius:18px; padding:16px; margin:10px 0;}
+.tsp-muted {opacity:.7; font-size:.9rem;}
+.tsp-badge {display:inline-block; padding:4px 9px; border-radius:999px; border:1px solid rgba(128,128,128,.25); margin:2px 3px 2px 0; font-size:.80rem;}
+.tsp-good {border-left:5px solid #22a06b;}
+.tsp-warn {border-left:5px solid #d6a400;}
+.tsp-bad {border-left:5px solid #d64045;}
+.small {font-size:.86rem; opacity:.75;}
+@media (max-width:700px){.block-container{padding-left:.65rem;padding-right:.65rem} h1{font-size:1.7rem!important} h2{font-size:1.25rem!important} .tsp-hero{padding:14px}}
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
-# ----------------------------- Data -----------------------------
+# ---------------- DB ----------------
+def con():
+    c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row
+    c.execute("""CREATE TABLE IF NOT EXISTS tenders(
+      source TEXT, external_id TEXT, title TEXT, buyer TEXT, publication_date TEXT, deadline TEXT,
+      estimated_value REAL, currency TEXT, description TEXT, url TEXT, cpv TEXT, raw_json TEXT,
+      first_seen TEXT DEFAULT CURRENT_TIMESTAMP, last_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(source,external_id))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS watchlist(
+      source TEXT, external_id TEXT, note TEXT DEFAULT '', status TEXT DEFAULT 'Prüfen', created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY(source,external_id))""")
+    c.commit(); return c
 
-def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS tenders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source TEXT NOT NULL,
-            external_id TEXT NOT NULL,
-            title TEXT,
-            buyer TEXT,
-            country TEXT,
-            publication_date TEXT,
-            deadline TEXT,
-            estimated_value REAL,
-            description TEXT,
-            url TEXT,
-            cpv TEXT,
-            contract_nature TEXT,
-            notice_type TEXT,
-            raw_json TEXT,
-            first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(source, external_id)
-        )
-        """
-    )
-    cols = {r[1] for r in con.execute("PRAGMA table_info(tenders)").fetchall()}
-    migrations = {
-        "publication_date": "TEXT",
-        "first_seen": "TEXT",
-        "updated_at": "TEXT",
-        "cpv": "TEXT",
-        "contract_nature": "TEXT",
-        "notice_type": "TEXT",
-    }
-    for name, ddl in migrations.items():
-        if name not in cols:
-            con.execute(f"ALTER TABLE tenders ADD COLUMN {name} {ddl}")
-
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS watchlist (
-            source TEXT NOT NULL,
-            external_id TEXT NOT NULL,
-            note TEXT DEFAULT '',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(source, external_id)
-        )
-        """
-    )
-    con.commit()
-    return con
-
-
-def as_text(v: Any) -> str:
-    if v is None:
-        return ""
-    if isinstance(v, str):
-        return v
-    if isinstance(v, (int, float)):
-        return str(v)
-    if isinstance(v, list):
-        return " | ".join(as_text(x) for x in v if x is not None)
-    if isinstance(v, dict):
-        for lang in ("deu", "de", "ger", "eng", "en"):
-            if lang in v:
-                return as_text(v[lang])
-        return " | ".join(as_text(x) for x in v.values() if x is not None)
+# ---------------- generic helpers ----------------
+def txt(v):
+    if v is None: return ""
+    if isinstance(v,str): return v.strip()
+    if isinstance(v,(int,float)): return str(v)
+    if isinstance(v,list): return " | ".join(x for x in [txt(i) for i in v] if x)
+    if isinstance(v,dict):
+        for k in ("deu","de","ger","eng","en"):
+            if k in v and txt(v[k]): return txt(v[k])
+        return " | ".join(x for x in [txt(i) for i in v.values()] if x)
     return str(v)
 
-
-def first_value(obj: Dict[str, Any], keys: List[str], default="") -> Any:
+def first(d, keys, default=""):
     for k in keys:
-        if k in obj and obj[k] not in (None, "", [], {}):
-            return obj[k]
-    normalized = {re.sub(r"[^a-z0-9]", "", str(k).lower()): k for k in obj.keys()}
-    for k in keys:
-        nk = re.sub(r"[^a-z0-9]", "", k.lower())
-        if nk in normalized:
-            real = normalized[nk]
-            if obj[real] not in (None, "", [], {}):
-                return obj[real]
+        if isinstance(d,dict) and k in d and d[k] not in (None,"",[],{}): return d[k]
     return default
 
-
-def parse_number(v: Any) -> Optional[float]:
-    if v in (None, ""):
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
-    if isinstance(v, list):
-        vals = [parse_number(x) for x in v]
-        vals = [x for x in vals if x is not None]
-        return max(vals) if vals else None
-    if isinstance(v, dict):
-        for key in ("value", "amount", "val"):
-            if key in v:
-                return parse_number(v[key])
-        vals = [parse_number(x) for x in v.values()]
-        vals = [x for x in vals if x is not None]
-        return max(vals) if vals else None
-    s = as_text(v).replace("€", "").replace("EUR", "").replace("eur", "").strip()
-    s = re.sub(r"[^0-9,.-]", "", s)
-    if not s:
-        return None
+def number(v):
+    if v is None or v=="": return None
+    if isinstance(v,(int,float)): return float(v)
+    if isinstance(v,list):
+        z=[number(x) for x in v]; z=[x for x in z if x is not None]; return max(z) if z else None
+    if isinstance(v,dict):
+        for k in ("value","amount","val"):
+            if k in v: return number(v[k])
+        z=[number(x) for x in v.values()]; z=[x for x in z if x is not None]; return max(z) if z else None
+    s=re.sub(r"[^0-9,.-]","",txt(v))
+    if not s: return None
     if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
-    elif "," in s:
-        s = s.replace(".", "").replace(",", ".")
-    try:
-        return float(s)
-    except ValueError:
-        return None
+        s=s.replace(".","").replace(",",".") if s.rfind(",")>s.rfind(".") else s.replace(",","")
+    elif "," in s: s=s.replace(".","").replace(",",".")
+    try:return float(s)
+    except:return None
 
-
-def parse_date(text: str) -> Optional[date]:
-    if not text:
-        return None
-    s = str(text)
-    patterns = [
-        (r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})", "ymd"),
-        (r"(\d{1,2})[.](\d{1,2})[.](20\d{2})", "dmy"),
-    ]
-    for pat, kind in patterns:
-        m = re.search(pat, s)
-        if not m:
-            continue
-        try:
-            if kind == "ymd":
-                return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-        except ValueError:
-            pass
+def date_parse(v):
+    s=txt(v)
+    if not s:return None
+    for pattern, order in [(r"(20\d\d)[-/.](\d\d?)[-/.](\d\d?)","ymd"),(r"(\d\d?)[.](\d\d?)[.](20\d\d)","dmy")]:
+        m=re.search(pattern,s)
+        if m:
+            try:
+                return date(int(m.group(1)),int(m.group(2)),int(m.group(3))) if order=="ymd" else date(int(m.group(3)),int(m.group(2)),int(m.group(1)))
+            except: pass
     return None
 
+def eur(v):
+    if v is None:return "–"
+    return f"{v:,.0f} €".replace(",",".")
 
-def clean_url(v: Any, external_id: str) -> str:
-    txt = as_text(v)
-    m = re.search(r"https?://[^\s|\]\[\"']+", txt)
-    if m:
-        return m.group(0).rstrip(",.;")
-    if external_id:
-        return f"https://ted.europa.eu/de/notice/-/detail/{external_id}"
-    return ""
+def clean_space(s): return re.sub(r"\s+"," ",txt(s)).strip()
 
+def find_url(obj):
+    s=txt(obj); m=re.search(r"https?://[^\s|\]\[\"']+",s)
+    return m.group(0).rstrip(",.;") if m else ""
 
-def normalize_ted_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    external_id = as_text(first_value(item, ["publication-number", "publicationNumber", "notice-id", "noticeId", "id"]))
-    title = as_text(first_value(item, ["notice-title", "noticeTitle", "title", "procedure-title", "BT-21-Procedure"]))
-    buyer = as_text(first_value(item, ["buyer-name", "buyerName", "organisation-name-buyer", "organizationName", "buyer"]))
-    publication_date = as_text(first_value(item, ["publication-date", "publicationDate", "date-publication"]))
-    deadline = as_text(first_value(item, ["deadline-receipt-tender", "deadline", "submission-deadline", "BT-131(d)-Lot"]))
-    value = parse_number(first_value(item, ["estimated-value-procurement", "estimatedValue", "value", "BT-27-Procedure"]))
-    country = as_text(first_value(item, ["place-of-performance-country-proc", "place-of-performance", "country", "buyer-country", "BT-5141-Procedure"]))
-    description = as_text(first_value(item, ["description-proc", "description", "short-description", "BT-24-Procedure"]))
-    cpv = as_text(first_value(item, ["classification-cpv", "main-classification-proc", "cpv", "BT-262-Procedure"]))
-    contract_nature = as_text(first_value(item, ["contract-nature", "nature", "contractNature", "BT-23-Procedure"]))
-    notice_type = as_text(first_value(item, ["notice-type", "form-type", "noticeType"]))
-    url = clean_url(first_value(item, ["links", "urls", "url", "notice-url"], ""), external_id)
-    if not external_id:
-        external_id = str(abs(hash(json.dumps(item, sort_keys=True, default=str))))
-    return {
-        "source": "TED",
-        "external_id": external_id,
-        "title": title or "Unbenannte Ausschreibung",
-        "buyer": buyer,
-        "country": country,
-        "publication_date": publication_date,
-        "deadline": deadline,
-        "estimated_value": value,
-        "description": description,
-        "url": url,
-        "cpv": cpv,
-        "contract_nature": contract_nature,
-        "notice_type": notice_type,
-        "raw_json": json.dumps(item, ensure_ascii=False, default=str),
-    }
-
-
-# ----------------------------- TED API -----------------------------
-
-# Conservative field set: these are actual TED search fields. URLs are returned by the API
-# response separately, therefore "links" is intentionally NOT requested as a field.
-TED_CORE_FIELDS = [
-    "publication-number",
-    "notice-title",
-    "buyer-name",
-    "publication-date",
-    "deadline-receipt-tender",
-    "estimated-value-procurement",
-    "description-proc",
-    "classification-cpv",
-    "contract-nature",
-    "notice-type",
+# ---------------- TED ----------------
+TED_FIELDS=[
+ "publication-number","notice-title","buyer-name","publication-date",
+ "deadline-receipt-tender-date-lot","estimated-value-proc","estimated-value-lot",
+ "description-proc","description-lot","main-classification-proc","main-classification-lot",
+ "contract-nature-proc","notice-type"
 ]
+TED_MIN=["publication-number","notice-title","buyer-name","publication-date"]
 
-TED_MIN_FIELDS = ["publication-number", "notice-title", "buyer-name", "publication-date"]
+def ted_call(query, limit=100, fields=None):
+    payload={"query":query,"fields":fields or TED_FIELDS,"page":1,"limit":min(limit,250),"scope":"ACTIVE","checkQuerySyntax":True,"paginationMode":"PAGE_NUMBER"}
+    r=requests.post(TED_SEARCH_URL,json=payload,timeout=30)
+    if r.status_code>=400:
+        # Retry without optional scope/check fields because API deployments can vary.
+        payload={"query":query,"fields":fields or TED_MIN,"page":1,"limit":min(limit,250)}
+        r=requests.post(TED_SEARCH_URL,json=payload,timeout=30)
+    r.raise_for_status(); return r.json()
 
+def results_from_response(data):
+    if isinstance(data,list):return data
+    if not isinstance(data,dict):return []
+    for k in ("notices","results","items"):
+        if isinstance(data.get(k),list):return data[k]
+    return []
 
-def ted_request(query: str, limit: int, fields: List[str]) -> requests.Response:
-    payload = {
-        "query": query,
-        "fields": fields,
-        "page": 1,
-        "limit": int(limit),
-        "scope": "ACTIVE",
-        "checkQuerySyntax": False,
-        "paginationMode": "PAGE_NUMBER",
-    }
-    return requests.post(
-        TED_SEARCH_URL,
-        json=payload,
-        headers={"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "TenderScoutPro/2.0"},
-        timeout=35,
-    )
+def normalize_ted(item):
+    eid=txt(first(item,["publication-number","notice-id","id"]))
+    if not eid:eid=str(abs(hash(json.dumps(item,sort_keys=True,default=str))))
+    title=txt(first(item,["notice-title","procedure-title","title"])) or "Unbenannte Ausschreibung"
+    buyer=txt(first(item,["buyer-name","organisation-name-buyer","buyer"]))
+    pub=txt(first(item,["publication-date","date-publication"]))
+    ddl=txt(first(item,["deadline-receipt-tender-date-lot","deadline"]))
+    val=number(first(item,["estimated-value-lot","estimated-value-proc","value"]))
+    desc=txt(first(item,["description-lot","description-proc","description","short-description"]))
+    cpv=txt(first(item,["main-classification-lot","main-classification-proc","cpv"]))
+    url=find_url(first(item,["links","urls","url"],"")) or f"https://ted.europa.eu/de/notice/-/detail/{eid}"
+    return dict(source="TED",external_id=eid,title=title,buyer=buyer,publication_date=pub,deadline=ddl,estimated_value=val,currency="EUR",description=desc,url=url,cpv=cpv,raw_json=json.dumps(item,ensure_ascii=False,default=str))
 
+def save_tenders(rows):
+    c=con(); new=0
+    for r in rows:
+        existed=c.execute("SELECT 1 FROM tenders WHERE source=? AND external_id=?",(r["source"],r["external_id"])).fetchone()
+        c.execute("""INSERT INTO tenders(source,external_id,title,buyer,publication_date,deadline,estimated_value,currency,description,url,cpv,raw_json)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source,external_id) DO UPDATE SET
+        title=excluded.title,buyer=excluded.buyer,publication_date=excluded.publication_date,deadline=excluded.deadline,
+        estimated_value=excluded.estimated_value,currency=excluded.currency,description=excluded.description,url=excluded.url,cpv=excluded.cpv,
+        raw_json=excluded.raw_json,last_seen=CURRENT_TIMESTAMP""",tuple(r[k] for k in ["source","external_id","title","buyer","publication_date","deadline","estimated_value","currency","description","url","cpv","raw_json"]))
+        if not existed:new+=1
+    c.commit();return new
 
-def error_detail(resp: requests.Response) -> str:
-    try:
-        data = resp.json()
-        txt = json.dumps(data, ensure_ascii=False)
-    except Exception:
-        txt = resp.text
-    return txt[:700]
-
-
-def ted_search(query: str, limit: int = 100) -> Tuple[List[Dict[str, Any]], str]:
-    """Search TED with robust fallback. Returns (items, mode_message)."""
-    attempts = [
-        (query, TED_CORE_FIELDS, "vollständige Felder"),
-        (query, TED_MIN_FIELDS, "Basisfelder"),
+def scan_ted(limit=120, days=45):
+    # Broad Germany query; hard deadline filtering happens locally to avoid relying on one TED field layout.
+    queries=[
+      "place-of-performance IN (DEU)",
+      "buyer-country IN (DEU)",
+      "CY = DEU"
     ]
-    last_error = ""
-    for q, fields, label in attempts:
-        resp = ted_request(q, limit, fields)
-        if resp.ok:
-            data = resp.json()
-            items = data.get("notices") or data.get("results") or data.get("items") or data.get("content") or []
-            if isinstance(items, dict):
-                items = items.get("items") or items.get("content") or []
-            normalized = [normalize_ted_item(x) for x in items if isinstance(x, dict)]
-            return normalized, label
-        last_error = f"HTTP {resp.status_code}: {error_detail(resp)}"
+    errors=[]
+    for q in queries:
+        try:
+            data=ted_call(q,limit,TED_FIELDS); items=results_from_response(data)
+            if items:return [normalize_ted(x) for x in items],q,None
+        except Exception as e: errors.append(str(e))
+    return [],queries[0]," | ".join(errors[-2:])
 
-    raise RuntimeError(last_error or "TED hat die Abfrage abgelehnt.")
-
-
-def build_ted_query(profile: str, keyword: str = "") -> str:
-    # TED uses ISO-3166 alpha-3 country codes in place-of-performance search, e.g. DEU.
-    base = "place-of-performance IN (DEU)"
-    profile_queries = {
-        "Alle Lieferaufträge": "contract-nature = supplies",
-        "IT & Elektro": "classification-cpv IN (30* 31* 32*)",
-        "Werkzeug & Industriebedarf": "classification-cpv IN (42* 43* 44*)",
-        "Büro, Möbel & Verbrauch": "classification-cpv IN (30* 39*)",
-        "Reinigung & Hygiene": "classification-cpv IN (33* 39*)",
-        "Textilien & Schutzkleidung": "classification-cpv IN (18*)",
-        "Nur Deutschland, breit": "",
-    }
-    extra = profile_queries.get(profile, "")
-    parts = [base]
-    if extra:
-        parts.append(extra)
-    if keyword.strip():
-        safe = re.sub(r"[^\wÄÖÜäöüß+./ -]", " ", keyword).strip()
-        if safe:
-            parts.append(f"FT ~ {safe}")
-    return " AND ".join(f"({p})" for p in parts)
-
-
-# ----------------------------- Persistence -----------------------------
-
-def save_tenders(items: List[Dict[str, Any]]) -> Tuple[int, int]:
-    con = db()
-    new_count = 0
-    updated_count = 0
-    for x in items:
-        key = (x.get("source", "Import"), x.get("external_id", ""))
-        existing = con.execute("SELECT id FROM tenders WHERE source=? AND external_id=?", key).fetchone()
-        vals = (
-            x.get("title", ""), x.get("buyer", ""), x.get("country", ""), x.get("publication_date", ""),
-            x.get("deadline", ""), x.get("estimated_value"), x.get("description", ""), x.get("url", ""),
-            x.get("cpv", ""), x.get("contract_nature", ""), x.get("notice_type", ""), x.get("raw_json", "{}"),
-        )
-        if existing:
-            con.execute(
-                """
-                UPDATE tenders SET title=?, buyer=?, country=?, publication_date=?, deadline=?, estimated_value=?,
-                description=?, url=?, cpv=?, contract_nature=?, notice_type=?, raw_json=?, updated_at=CURRENT_TIMESTAMP
-                WHERE id=?
-                """,
-                vals + (existing[0],),
-            )
-            updated_count += 1
-        else:
-            con.execute(
-                """
-                INSERT INTO tenders
-                (source, external_id, title, buyer, country, publication_date, deadline, estimated_value,
-                 description, url, cpv, contract_nature, notice_type, raw_json, first_seen, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """,
-                key + vals,
-            )
-            new_count += 1
-    con.commit()
-    con.close()
-    return new_count, updated_count
-
-
-def load_df() -> pd.DataFrame:
-    con = db()
-    df = pd.read_sql_query("SELECT * FROM tenders ORDER BY first_seen DESC, id DESC", con)
-    con.close()
-    return df
-
-
-def is_watchlisted(source: str, external_id: str) -> bool:
-    con = db()
-    hit = con.execute("SELECT 1 FROM watchlist WHERE source=? AND external_id=?", (source, external_id)).fetchone()
-    con.close()
-    return bool(hit)
-
-
-def toggle_watchlist(source: str, external_id: str) -> bool:
-    con = db()
-    hit = con.execute("SELECT 1 FROM watchlist WHERE source=? AND external_id=?", (source, external_id)).fetchone()
-    if hit:
-        con.execute("DELETE FROM watchlist WHERE source=? AND external_id=?", (source, external_id))
-        state = False
-    else:
-        con.execute("INSERT OR IGNORE INTO watchlist(source, external_id) VALUES (?, ?)", (source, external_id))
-        state = True
-    con.commit()
-    con.close()
-    return state
-
-
-# ----------------------------- Commercial analysis -----------------------------
-
-BLOCKED_TERMS = [
-    "munition", "waffe", "waffen", "sprengstoff", "sprengmittel", "rakete", "torpedo",
-    "explosivstoff", "feuerwaffe", "kampfmittel",
+# ---------------- Detail extraction ----------------
+QTY_PATTERNS=[
+ r"(?P<qty>\d{1,6})\s*(?:Stück|Stk\.?|pcs\.?|pieces)\s+(?P<product>.{4,100})",
+ r"(?P<product>.{4,100}?)\s*[-–:]?\s*(?P<qty>\d{1,6})\s*(?:Stück|Stk\.?|pcs\.?)",
+ r"Menge\s*[:=]\s*(?P<qty>\d{1,6})\s*[,;\-–]?\s*(?P<product>.{4,100})"
 ]
+MODEL_PATTERNS=[r"(?:Art\.?[- ]?Nr\.?|Artikelnummer|Bestellnummer|Modell|Typ)\s*[:#]?\s*([A-Z0-9][A-Z0-9._/-]{2,30})"]
 
-TRADE_GOODS = {
-    "verbrauchsmaterial": 11, "büromaterial": 10, "toner": 10, "papier": 7, "werkzeug": 9,
-    "handwerkzeug": 9, "ersatzteil": 8, "reinigung": 8, "hygiene": 8, "zubehör": 8,
-    "kabel": 9, "adapter": 9, "stecker": 8, "netzteil": 8, "befestigung": 8, "schraube": 7,
-    "filter": 7, "schlauch": 7, "verpackung": 7, "möbel": 6, "textil": 6, "batterie": 6,
-    "leuchte": 6, "monitor": 6, "hardware": 6, "computer": 5, "messgerät": 6, "elektro": 7,
-    "lager": 6, "drucker": 6, "arbeitskleidung": 7, "schutzkleidung": 7,
-}
+def extract_products(text):
+    s=clean_space(text)
+    out=[]
+    for pat in QTY_PATTERNS:
+        for m in re.finditer(pat,s,re.I):
+            prod=m.group("product").strip(" .,:;-")[:120]
+            try:q=int(m.group("qty"))
+            except:continue
+            if 0<q<1000000 and len(prod)>3: out.append({"produkt":prod,"menge":q})
+    # dedupe
+    seen=set(); final=[]
+    for x in out:
+        k=(x["produkt"].lower(),x["menge"])
+        if k not in seen: seen.add(k); final.append(x)
+    return final[:20]
 
-BARRIER_TERMS = {
-    "sicherheitsüberprüfung": (-26, "Sicherheitsüberprüfung"),
-    "vs-nfd": (-24, "VS-NfD / Sicherheitsanforderung"),
-    "geheim": (-25, "Geheimschutz"),
-    "bankbürgschaft": (-16, "Bankbürgschaft"),
-    "sicherheitsleistung": (-13, "Sicherheitsleistung"),
-    "umsatznachweis": (-10, "Umsatznachweis"),
-    "mindestens 3 referenzen": (-11, "mehrere Referenzen"),
-    "referenzen": (-6, "Referenzen prüfen"),
-    "iso 9001": (-7, "ISO 9001"),
-    "zertifizierung": (-6, "Zertifizierung"),
-    "vertragsstrafe": (-7, "Vertragsstrafe"),
-    "rahmenvereinbarung": (-3, "Rahmenvereinbarung"),
-}
+def extract_models(text):
+    r=[]
+    for pat in MODEL_PATTERNS:
+        r += re.findall(pat,text or "",re.I)
+    return list(dict.fromkeys(r))[:20]
 
+def detect_requirements(text):
+    s=(text or "").lower()
+    tests={
+      "Referenzen":["referenz","vergleichbare aufträge"],
+      "Bürgschaft":["bürgschaft","sicherheitseinbehalt"],
+      "ISO/QM":["iso 9001","qualitätsmanagement"],
+      "Sicherheitsprüfung":["sicherheitsüberprüfung","geheimschutz"],
+      "Muster/Probe":["muster","probeexemplar"],
+      "Nachhaltigkeit":["umweltzeichen","nachhaltigkeit","blauer engel"],
+      "Rahmenvertrag":["rahmenvereinbarung","rahmenvertrag"]
+    }
+    return [name for name,keys in tests.items() if any(k in s for k in keys)]
 
-def extract_search_term(title: str, description: str) -> str:
-    text = re.sub(r"[^A-Za-zÄÖÜäöüß0-9+./ -]", " ", f"{title} {description}")
-    text = re.sub(r"\s+", " ", text).strip()
-    low = text.lower()
-    for kw in TRADE_GOODS:
-        if kw in low:
-            idx = low.find(kw)
-            return text[max(0, idx - 35): min(len(text), idx + len(kw) + 60)].strip()[:120]
-    return (title or text)[:120]
+def deadline_state(v):
+    d=date_parse(v)
+    if not d:return ("unknown",None)
+    days=(d-date.today()).days
+    if days<0:return ("expired",days)
+    return ("active",days)
 
+def analyze(row, capital, reserve, target_margin, max_ticket):
+    value=row.get("estimated_value")
+    state,days=deadline_state(row.get("deadline"))
+    text=f"{row.get('title','')} {row.get('description','')}"
+    products=extract_products(text); models=extract_models(text); req=detect_requirements(text)
+    usable=max(0,capital-reserve)
+    max_buy=value*(1-target_margin/100) if value else None
+    funding=max(0,max_buy-usable) if max_buy is not None else None
+    theoretical_gp=value-max_buy if value and max_buy is not None else None
+    score=50
+    if state=="expired":score=0
+    elif state=="unknown":score-=12
+    elif days is not None:
+        if days>=14:score+=10
+        elif days<5:score-=15
+    if value:
+        if value<=max_ticket:score+=10
+        if max_buy and max_buy<=usable:score+=25
+        elif max_buy and max_buy<=usable*2:score+=8
+        else:score-=12
+    else:score-=5
+    if products:score+=8
+    if "Rahmenvertrag" in req:score-=4
+    if "Sicherheitsprüfung" in req:score-=20
+    if "Bürgschaft" in req:score-=12
+    score=max(0,min(100,score))
+    label="GO" if score>=75 else "PRÜFEN" if score>=50 else "NO-GO"
+    return dict(score=score,label=label,state=state,days=days,products=products,models=models,requirements=req,max_buy=max_buy,funding=funding,gp=theoretical_gp,usable=usable)
 
-def supplier_links(term: str) -> List[Tuple[str, str]]:
-    q = quote_plus(term)
+def sourcing_links(query):
+    q=quote_plus(query)
     return [
-        ("🔎 Google B2B / Großhandel", f"https://www.google.com/search?q={q}+Gro%C3%9Fhandel+B2B+Deutschland"),
-        ("🏭 Hersteller suchen", f"https://www.google.com/search?q={q}+Hersteller+Deutschland+Distributor"),
-        ("🧾 Unite / Mercateo", f"https://www.google.com/search?q=site%3Aunite.eu+{q}"),
-        ("⚙️ RS", f"https://www.google.com/search?q=site%3Ade.rs-online.com+{q}"),
-        ("🔌 Conrad", f"https://www.google.com/search?q=site%3Aconrad.de+{q}"),
-        ("🛠️ Würth", f"https://www.google.com/search?q=site%3Awuerth.de+{q}"),
-        ("💡 Farnell", f"https://www.google.com/search?q=site%3Ade.farnell.com+{q}"),
-        ("📦 Distrelec", f"https://www.google.com/search?q=site%3Adistrelec.de+{q}"),
+      ("Google Shopping / Händler",f"https://www.google.com/search?q={q}+kaufen+Gro%C3%9Fhandel"),
+      ("Hersteller finden",f"https://www.google.com/search?q={q}+Hersteller+Deutschland"),
+      ("Unite / Mercateo",f"https://www.google.com/search?q=site%3Aunite.eu+{q}"),
+      ("RS",f"https://de.rs-online.com/web/c/?searchTerm={q}"),
+      ("Conrad",f"https://www.conrad.de/de/search.html?search={q}"),
+      ("Farnell",f"https://de.farnell.com/search?st={q}"),
+      ("Würth",f"https://www.google.com/search?q=site%3Awuerth.de+{q}")
     ]
 
+# ---------------- import/export ----------------
+def all_rows(): return [dict(r) for r in con().execute("SELECT * FROM tenders ORDER BY first_seen DESC").fetchall()]
+def watch_ids(): return {(r[0],r[1]) for r in con().execute("SELECT source,external_id FROM watchlist").fetchall()}
+def watch_toggle(row):
+    c=con(); key=(row["source"],row["external_id"])
+    ex=c.execute("SELECT 1 FROM watchlist WHERE source=? AND external_id=?",key).fetchone()
+    if ex:c.execute("DELETE FROM watchlist WHERE source=? AND external_id=?",key)
+    else:c.execute("INSERT INTO watchlist(source,external_id) VALUES(?,?)",key)
+    c.commit()
 
-def analyze(row: Dict[str, Any], capital: float, target_markup: float, reserve_pct: float,
-            include_keywords: str, exclude_keywords: str) -> Dict[str, Any]:
-    title = str(row.get("title") or "")
-    desc = str(row.get("description") or "")
-    cpv = str(row.get("cpv") or "")
-    text = f"{title} {desc} {cpv}".lower()
+def backup_bytes():
+    c=con(); tenders=pd.read_sql_query("SELECT * FROM tenders",c); watch=pd.read_sql_query("SELECT * FROM watchlist",c)
+    bio=io.BytesIO()
+    with zipfile.ZipFile(bio,"w",zipfile.ZIP_DEFLATED) as z:
+        z.writestr("tenders.csv",tenders.to_csv(index=False)); z.writestr("watchlist.csv",watch.to_csv(index=False))
+    return bio.getvalue()
 
-    blocked_hits = [kw for kw in BLOCKED_TERMS if kw in text]
-    if blocked_hits:
-        return {
-            "Score": 0, "Bewertung": "⛔ Ausgeschlossen", "Status": "NO-GO", "blocked": True,
-            "Geschätzter Einkauf €": None, "Geschätzter Rohertrag €": None, "Finanzierungslücke €": None,
-            "Max. Einkauf für Zielmarge €": None, "Tage bis Frist": None, "Pluspunkte": "",
-            "Risiken": "Regulierte/waffenbezogene Beschaffung erkannt", "Beschaffungssuche": "",
-            "Confidence": "hoch", "NextAction": "Nicht bearbeiten.",
-        }
-
-    score = 45.0
-    reasons: List[str] = []
-    risks: List[str] = []
-
-    # Product-fit signal
-    product_hits = []
-    for kw, pts in TRADE_GOODS.items():
-        if kw in text:
-            product_hits.append(kw)
-            score += min(pts, 8)
-    if product_hits:
-        reasons.append("Handelsware erkennbar: " + ", ".join(product_hits[:4]))
-        score = min(score, 68)  # cap before finance/deadline/barriers
-
-    # User inclusion/exclusion keywords
-    includes = [x.strip().lower() for x in re.split(r"[,;\n]", include_keywords) if x.strip()]
-    excludes = [x.strip().lower() for x in re.split(r"[,;\n]", exclude_keywords) if x.strip()]
-    inc_hits = [x for x in includes if x in text]
-    exc_hits = [x for x in excludes if x in text]
-    if inc_hits:
-        score += min(12, 4 * len(inc_hits))
-        reasons.append("Deine Wunschbegriffe: " + ", ".join(inc_hits[:3]))
-    if exc_hits:
-        score -= min(25, 10 * len(exc_hits))
-        risks.append("Von dir ausgeschlossen: " + ", ".join(exc_hits[:3]))
-
-    # Barriers
-    for kw, (pts, label) in BARRIER_TERMS.items():
-        if kw in text:
-            score += pts
-            risks.append(label)
-
-    # Contract nature preference
-    nature = str(row.get("contract_nature") or "").lower()
-    if "suppl" in nature or "liefer" in nature:
-        score += 8
-        reasons.append("Lieferauftrag")
-    elif nature and ("service" in nature or "dienst" in nature or "works" in nature or "bau" in nature):
-        score -= 10
-        risks.append("Nicht primär Warenlieferung")
-
-    # Finance model
-    value = row.get("estimated_value")
-    try:
-        value = float(value) if value not in (None, "") and not pd.isna(value) else None
-    except Exception:
-        value = None
-
-    usable = max(0.0, capital * (1 - reserve_pct / 100))
-    est_purchase = est_profit = gap = max_buy = None
-    if value and value > 0:
-        max_buy = value / (1 + target_markup / 100)
-        est_purchase = max_buy
-        est_profit = value - est_purchase
-        gap = max(0.0, est_purchase - usable)
-        ratio = est_purchase / usable if usable > 0 else math.inf
-        if ratio <= 1.0:
-            score += 23
-            reasons.append("Modell-Einkauf aus deinem freien Kapital finanzierbar")
-        elif ratio <= 1.25:
-            score += 5
-            risks.append("kleine Finanzierungslücke")
-        elif ratio <= 2.0:
-            score -= 12
-            risks.append("deutliche Vorfinanzierung nötig")
-        else:
-            score -= 27
-            risks.append("Kapitalbedarf weit über deinem aktuellen Budget")
-    else:
-        score -= 4
-        risks.append("Auftragswert fehlt – manuell kalkulieren")
-
-    # Deadline
-    deadline_date = parse_date(str(row.get("deadline") or ""))
-    days_left = (deadline_date - date.today()).days if deadline_date else None
-    if days_left is None:
-        risks.append("Angebotsfrist nicht automatisch erkannt")
-    elif days_left < 0:
-        score -= 70
-        risks.append("Frist abgelaufen")
-    elif days_left <= 2:
-        score -= 18
-        risks.append("extrem kurze Angebotsfrist")
-    elif days_left <= 5:
-        score -= 8
-        risks.append("kurze Angebotsfrist")
-    elif days_left >= 14:
-        score += 7
-        reasons.append("gute Zeit für Lieferantenanfragen")
-
-    # Confidence and recommended action
-    confidence_points = sum([
-        bool(title), bool(desc), bool(row.get("buyer")), bool(row.get("deadline")), bool(value), bool(cpv)
-    ])
-    confidence = "hoch" if confidence_points >= 5 else "mittel" if confidence_points >= 3 else "niedrig"
-
-    score = int(max(0, min(100, round(score))))
-    if score >= 78:
-        verdict, status, action = "🟢 Sehr interessant", "GO", "Originalunterlagen öffnen und heute 2–3 Lieferanten anfragen."
-    elif score >= 60:
-        verdict, status, action = "🟡 Prüfen", "CHECK", "Muss-Kriterien und Mengen prüfen; danach Einkaufspreise einholen."
-    elif score >= 40:
-        verdict, status, action = "🟠 Nur bei gutem Einkaufspreis", "MAYBE", "Nur weiterverfolgen, wenn Beschaffung sehr einfach oder Finanzierung lösbar ist."
-    else:
-        verdict, status, action = "🔴 Eher überspringen", "NO-GO", "Zeit lieber in höher bewertete Chancen investieren."
-
-    return {
-        "Score": score,
-        "Bewertung": verdict,
-        "Status": status,
-        "blocked": False,
-        "Geschätzter Einkauf €": round(est_purchase, 2) if est_purchase is not None else None,
-        "Geschätzter Rohertrag €": round(est_profit, 2) if est_profit is not None else None,
-        "Finanzierungslücke €": round(gap, 2) if gap is not None else None,
-        "Max. Einkauf für Zielmarge €": round(max_buy, 2) if max_buy is not None else None,
-        "Tage bis Frist": days_left,
-        "Pluspunkte": "; ".join(dict.fromkeys(reasons)),
-        "Risiken": "; ".join(dict.fromkeys(risks)),
-        "Beschaffungssuche": extract_search_term(title, desc),
-        "Confidence": confidence,
-        "NextAction": action,
-    }
-
-
-def analyzed_df(capital: float, markup: float, reserve: float, include_kw: str, exclude_kw: str) -> pd.DataFrame:
-    df = load_df()
-    if df.empty:
-        return df
-    rows = []
-    for _, r in df.iterrows():
-        base = r.to_dict()
-        base.update(analyze(base, capital, markup, reserve, include_kw, exclude_kw))
-        rows.append(base)
-    out = pd.DataFrame(rows)
-    return out.sort_values(["Score", "first_seen"], ascending=[False, False])
-
-
-# ----------------------------- Import -----------------------------
-
-def normalize_import(df: pd.DataFrame, source: str) -> List[Dict[str, Any]]:
-    aliases = {
-        "external_id": ["external_id", "id", "publication-number", "notice_id"],
-        "title": ["title", "titel", "notice-title", "bezeichnung"],
-        "buyer": ["buyer", "auftraggeber", "buyer-name", "organisation"],
-        "country": ["country", "land"],
-        "publication_date": ["publication_date", "veroeffentlichung", "publication-date"],
-        "deadline": ["deadline", "frist", "submission_deadline"],
-        "estimated_value": ["estimated_value", "auftragswert", "value", "wert"],
-        "description": ["description", "beschreibung", "text"],
-        "url": ["url", "link"],
-        "cpv": ["cpv", "classification-cpv"],
-        "contract_nature": ["contract_nature", "contract-nature", "auftragsart"],
-        "notice_type": ["notice_type", "notice-type"],
-    }
-    cols = {str(c).lower().strip(): c for c in df.columns}
-    out = []
-    for i, row in df.iterrows():
-        x: Dict[str, Any] = {"source": source}
-        for target, names in aliases.items():
-            found = next((cols[n] for n in names if n in cols), None)
-            x[target] = row[found] if found is not None and not pd.isna(row[found]) else ""
-        if not x["external_id"]:
-            x["external_id"] = f"{source}-{i}-{abs(hash(str(row.to_dict())))}"
-        x["estimated_value"] = parse_number(x["estimated_value"])
-        x["raw_json"] = json.dumps(row.to_dict(), ensure_ascii=False, default=str)
-        out.append(x)
-    return out
-
-
-# ----------------------------- Helpers UI -----------------------------
-
-def euro(v: Any) -> str:
-    try:
-        if v is None or pd.isna(v):
-            return "–"
-        return f"{float(v):,.0f} €".replace(",", ".")
-    except Exception:
-        return "–"
-
-
-def tender_label(r: pd.Series) -> str:
-    title = str(r.get("title") or "Unbenannt")
-    return f"{int(r['Score'])}/100 · {title[:82]}"
-
-
-def render_opportunity(r: pd.Series, compact: bool = False) -> None:
-    title = str(r.get("title") or "Unbenannte Ausschreibung")
-    st.markdown(f"### {title}")
-    st.caption(f"{r.get('buyer') or 'Auftraggeber unbekannt'} · TED {r.get('external_id') or ''}")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Score", f"{int(r['Score'])}/100")
-    c2.metric("Auftragswert", euro(r.get("estimated_value")))
-    c3.metric("Modell-Einkauf*", euro(r.get("Geschätzter Einkauf €")))
-    c4.metric("Finanzierungslücke", euro(r.get("Finanzierungslücke €")))
-    st.write(r.get("Bewertung"), "· Datenqualität:", r.get("Confidence", "–"))
-    if r.get("Pluspunkte"):
-        st.success(r["Pluspunkte"])
-    if r.get("Risiken"):
-        st.warning(r["Risiken"])
-    st.info("**Nächster Schritt:** " + str(r.get("NextAction") or "Originalunterlagen prüfen."))
-    if not compact:
-        st.write("**Veröffentlicht:**", r.get("publication_date") or "–")
-        st.write("**Angebotsfrist:**", r.get("deadline") or "–")
-        st.write("**CPV:**", r.get("cpv") or "–")
-        st.write("**Auftragsart:**", r.get("contract_nature") or "–")
-        if r.get("description"):
-            with st.expander("Kurzbeschreibung"):
-                st.write(r.get("description"))
-
-
-# ----------------------------- User profile -----------------------------
-
-st.title("📦 Tender Scout Pro")
-st.caption(f"Opportunity Intelligence für öffentliche B2B-Waren · v{APP_VERSION}")
+# ---------------- session/settings ----------------
+def init():
+    defaults={"page":"Dashboard","capital":2000.0,"reserve":500.0,"margin":20.0,"max_ticket":10000.0,"selected":None,"only_active":True,"min_days":3}
+    for k,v in defaults.items(): st.session_state.setdefault(k,v)
+init()
 
 with st.sidebar:
-    st.header("💶 Geschäftsprofil")
-    capital = st.number_input("Verfügbares Startkapital (€)", min_value=100.0, value=2000.0, step=100.0)
-    reserve_pct = st.slider("Liquiditätsreserve (%)", 0, 80, 40, 5)
-    markup = st.slider("Zielaufschlag auf Einkauf (%)", 5, 100, 25, 5)
-    st.metric("Für Ware frei", euro(capital * (1 - reserve_pct / 100)))
-    st.divider()
-    st.subheader("🎯 Persönlicher Filter")
-    include_kw = st.text_area("Bevorzugte Begriffe", value="Kabel, Werkzeug, Verbrauchsmaterial, Ersatzteile", height=80)
-    exclude_kw = st.text_area("Ausschließen", value="Bauleistung, Planung, Beratung", height=70)
-    st.caption("Kommagetrennt. Diese Begriffe beeinflussen deinen Score.")
+    st.markdown("## ⚙️ Dein Profil")
+    st.session_state.capital=st.number_input("Kapital",0.0,1000000.0,float(st.session_state.capital),100.0)
+    st.session_state.reserve=st.number_input("Reserve",0.0,1000000.0,float(st.session_state.reserve),100.0)
+    st.session_state.margin=st.slider("Ziel-Rohertrag %",5,50,int(st.session_state.margin))
+    st.session_state.max_ticket=st.number_input("Max. gewünschtes Auftragsvolumen",500.0,10000000.0,float(st.session_state.max_ticket),500.0)
+    st.session_state.only_active=st.toggle("Nur aktive Fristen",value=st.session_state.only_active)
+    st.session_state.min_days=st.slider("Mindestens Tage bis Frist",0,60,int(st.session_state.min_days))
+    st.caption("Ausschreibungswerte sind keine Umsatzgarantie. Preise und Mengen müssen in den Originalunterlagen bestätigt werden.")
 
-# ----------------------------- Tabs -----------------------------
+st.markdown(f"""<div class='tsp-hero'><div class='small'>TENDER SCOUT</div><h1 style='margin:.1rem 0'>📦 Tender Scout Pro</h1><div class='tsp-muted'>Ausschreibungen → Deal-Akte → Beschaffung → Kalkulation</div></div>""",unsafe_allow_html=True)
 
-tab_today, tab_analysis, tab_source, tab_watch, tab_import = st.tabs(
-    ["🔥 Heute", "🔎 Deal-Analyse", "🌍 Scanner", "⭐ Watchlist", "📥 Import"]
-)
+menu=st.radio("Navigation",["Dashboard","Scanner","Deals","Watchlist","Kalkulator","Einstellungen"],horizontal=True,label_visibility="collapsed",key="page")
+capital=st.session_state.capital; reserve=st.session_state.reserve; margin=st.session_state.margin; max_ticket=st.session_state.max_ticket
 
-with tab_today:
-    st.subheader("Daily Opportunity Scan")
-    st.write("Scanne aktuelle TED-Bekanntmachungen mit Leistungsort Deutschland und priorisiere sie nach Kapital, Handelswaren-Fit und Hürden.")
+rows=all_rows(); wids=watch_ids()
 
-    col_a, col_b = st.columns([2, 1])
-    with col_a:
-        scan_profile = st.selectbox(
-            "Scan-Profil",
-            ["Alle Lieferaufträge", "IT & Elektro", "Werkzeug & Industriebedarf", "Büro, Möbel & Verbrauch", "Reinigung & Hygiene", "Textilien & Schutzkleidung", "Nur Deutschland, breit"],
-        )
-    with col_b:
-        scan_limit = st.selectbox("Treffer", [50, 100, 150, 250], index=1)
-    keyword = st.text_input("Optionaler Suchbegriff", placeholder="z. B. Kabel, Filter, Drucker, Werkzeug …")
+def filtered_rows(rows):
+    out=[]
+    for r in rows:
+        a=analyze(r,capital,reserve,margin,max_ticket)
+        if st.session_state.only_active:
+            if a["state"]=="expired":continue
+            if a["state"]=="active" and a["days"] is not None and a["days"]<st.session_state.min_days:continue
+        r=dict(r); r["_a"]=a; out.append(r)
+    return sorted(out,key=lambda x:(x["_a"]["score"],x["publication_date"] or ""),reverse=True)
 
-    if st.button("🚀 Neue Ausschreibungen scannen", type="primary", use_container_width=True):
-        query = build_ted_query(scan_profile, keyword)
-        with st.spinner("TED wird durchsucht und Chancen werden bewertet …"):
-            try:
-                items, mode = ted_search(query, int(scan_limit))
-                new_n, upd_n = save_tenders(items)
-                st.success(f"Scan fertig: {len(items)} Treffer · {new_n} neu · {upd_n} aktualisiert · API-Modus: {mode}")
-                st.caption(f"TED Query: {query}")
-            except Exception as e:
-                st.error("TED-Live-Scan fehlgeschlagen.")
-                st.code(str(e))
-                st.info("Tipp: Nutze im Tab „Scanner“ zuerst den Verbindungstest. Die App zeigt dort die genaue TED-Antwort an.")
+frows=filtered_rows(rows)
 
-    out = analyzed_df(capital, markup, reserve_pct, include_kw, exclude_kw)
-    if out.empty:
-        st.info("Noch keine Daten. Starte oben deinen ersten Scan.")
-    else:
-        safe = out[~out["blocked"]].copy()
-        active = safe[(safe["Tage bis Frist"].isna()) | (safe["Tage bis Frist"] >= 0)]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Gespeichert", len(safe))
-        c2.metric("GO-Chancen", int((active["Score"] >= 78).sum()))
-        c3.metric("≥ 60 Punkte", int((active["Score"] >= 60).sum()))
-        c4.metric("Kapital passt", int((active["Finanzierungslücke €"].fillna(math.inf) <= 0).sum()))
+if menu=="Dashboard":
+    st.subheader("Heute")
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Aktive Chancen",len(frows))
+    c2.metric("GO",sum(1 for r in frows if r["_a"]["label"]=="GO"))
+    c3.metric("Watchlist",len(wids))
+    c4.metric("Nutzbares Kapital",eur(max(0,capital-reserve)))
+    st.markdown("### Beste Chancen")
+    if not frows: st.info("Noch keine Daten. Öffne **Scanner** und starte einen Live-Scan.")
+    for r in frows[:8]:
+        a=r["_a"]; cls="tsp-good" if a["label"]=="GO" else "tsp-warn" if a["label"]=="PRÜFEN" else "tsp-bad"
+        st.markdown(f"<div class='tsp-card {cls}'><b>{a['label']} · {a['score']}/100</b><br><b>{r['title']}</b><br><span class='tsp-muted'>{r['buyer'] or 'Auftraggeber nicht erkannt'} · {eur(r['estimated_value'])} · {'Frist unbekannt' if a['days'] is None else str(a['days'])+' Tage'}</span></div>",unsafe_allow_html=True)
+        if st.button("Deal öffnen",key="open"+r["external_id"]): st.session_state.selected=(r["source"],r["external_id"]); st.session_state.page="Deals"; st.rerun()
 
-        st.markdown("#### 🏆 Beste Chancen")
-        top = active.head(10)
-        if top.empty:
-            st.warning("Keine aktuell offenen Chancen erkannt.")
-        for _, r in top.iterrows():
-            days = r.get("Tage bis Frist")
-            days_txt = "Frist ?" if pd.isna(days) else f"{int(days)} Tage"
-            with st.expander(f"{int(r['Score'])}/100 · {r['title'][:90]} · {days_txt}"):
-                render_opportunity(r, compact=True)
-                if r.get("url"):
-                    st.link_button("📄 Original öffnen", r["url"], use_container_width=True)
-
-with tab_analysis:
-    st.subheader("Deal-Analyse")
-    out = analyzed_df(capital, markup, reserve_pct, include_kw, exclude_kw)
-    if out.empty:
-        st.info("Erst einen Scan durchführen.")
-    else:
-        out = out[~out["blocked"]].copy()
-        f1, f2 = st.columns(2)
-        min_score = f1.slider("Mindestscore", 0, 100, 55, 5)
-        only_financeable = f2.toggle("Nur ohne Finanzierungslücke", value=False)
-        search_text = st.text_input("Liste filtern", placeholder="Titel, Auftraggeber, CPV, Begriff …")
-        show = out[out["Score"] >= min_score]
-        if only_financeable:
-            show = show[show["Finanzierungslücke €"].fillna(math.inf) <= 0]
-        if search_text:
-            n = search_text.lower()
-            show = show[show.apply(lambda r: n in f"{r.get('title','')} {r.get('buyer','')} {r.get('description','')} {r.get('cpv','')}".lower(), axis=1)]
-
-        if show.empty:
-            st.warning("Keine Ausschreibung mit diesen Filtern.")
-        else:
-            options = {tender_label(r): idx for idx, r in show.iterrows()}
-            selection = st.selectbox("Ausschreibung", list(options.keys()))
-            r = show.loc[options[selection]]
-            render_opportunity(r)
-
-            st.markdown("#### 💰 Angebots-Kalkulator")
-            value = r.get("estimated_value")
-            if value is not None and not pd.isna(value):
-                st.write(f"Bei {markup}% Zielaufschlag solltest du für Ware + eingerechnete Einkaufskosten **höchstens {euro(r.get('Max. Einkauf für Zielmarge €'))}** ansetzen, bevor weitere Kosten berücksichtigt werden.")
-            extra_costs = st.number_input("Geschätzte Nebenkosten (€): Versand, Verpackung, Gebühren …", min_value=0.0, value=0.0, step=25.0)
-            supplier_quote = st.number_input("Echtes Lieferantenangebot (€), sobald vorhanden", min_value=0.0, value=0.0, step=50.0)
-            if supplier_quote > 0 and value is not None and not pd.isna(value):
-                gross = float(value) - supplier_quote - extra_costs
-                margin_on_sales = (gross / float(value) * 100) if float(value) else 0
-                st.metric("Kalkulierter Deckungsbeitrag", euro(gross), f"{margin_on_sales:.1f}% vom Umsatz")
-                if gross <= 0:
-                    st.error("Mit diesen Zahlen wäre der Auftrag wirtschaftlich nicht sinnvoll.")
-                elif supplier_quote + extra_costs > capital * (1 - reserve_pct / 100):
-                    st.warning("Wirtschaftlich möglich, aber aktuell nicht vollständig aus deinem freien Kapital finanzierbar.")
-                else:
-                    st.success("Die Beispielkalkulation liegt innerhalb deines freien Kapitals. Vertragsbedingungen trotzdem vollständig prüfen.")
-
-            st.markdown("#### 🏭 Beschaffung")
-            term = r.get("Beschaffungssuche") or r.get("title")
-            st.caption(f"Vorgeschlagener Suchbegriff: {term}")
-            for name, url in supplier_links(term):
-                st.link_button(name, url, use_container_width=True)
-            st.caption("Lieferantenlinks sind Recherchewege, keine Preis- oder Liefergarantie. Für ein Angebot immer Verfügbarkeit, Lieferzeit, Spezifikation und schriftlichen Nettopreis bestätigen lassen.")
-
-            st.markdown("#### ✅ Angebots-Checkliste")
-            checklist = [
-                "Exakte Positionen, Mengen, Hersteller-/Artikelvorgaben aus Originalunterlagen übernehmen.",
-                "Gleichwertigkeit/Alternativprodukte nur anbieten, wenn ausdrücklich zugelassen.",
-                "Eignungsnachweise, Referenzen, Zertifikate und Ausschlusskriterien prüfen.",
-                "2–3 verbindliche B2B-Lieferantenangebote mit Lieferzeit einholen.",
-                "Fracht, Verpackung, Retourenrisiko, Zahlungsziel und Steuern in die Kalkulation aufnehmen.",
-                "Abgabefrist und elektronische Signatur/Formvorgaben kontrollieren.",
-                "Erst danach verbindlichen Angebotspreis abgeben.",
-            ]
-            for item in checklist:
-                st.checkbox(item, key=f"chk_{r.get('external_id')}_{abs(hash(item))}")
-
-            watched = is_watchlisted(str(r.get("source")), str(r.get("external_id")))
-            if st.button("⭐ Von Watchlist entfernen" if watched else "☆ Zur Watchlist", use_container_width=True):
-                toggle_watchlist(str(r.get("source")), str(r.get("external_id")))
-                st.rerun()
-            if r.get("url"):
-                st.link_button("📄 Originalausschreibung", r["url"], type="primary", use_container_width=True)
-
-with tab_source:
-    st.subheader("Scanner & Verbindungstest")
-    st.caption("Hier kannst du TED-Abfragen kontrollieren. Standard für Deutschland ist DEU, nicht DE.")
-    preset = st.selectbox("Preset", ["Deutschland – alle Lieferungen", "Deutschland – breit", "Eigene Query"])
-    if preset == "Deutschland – alle Lieferungen":
-        default_q = "(place-of-performance IN (DEU)) AND (contract-nature = supplies)"
-    elif preset == "Deutschland – breit":
-        default_q = "place-of-performance IN (DEU)"
-    else:
-        default_q = "place-of-performance IN (DEU)"
-    q = st.text_area("TED Expert Query", value=default_q, height=90)
-    test_limit = st.slider("Test-Treffer", 5, 100, 20, 5)
-    if st.button("🧪 Verbindung testen", use_container_width=True):
-        with st.spinner("TED API testen …"):
-            try:
-                items, mode = ted_search(q, test_limit)
-                st.success(f"Verbindung OK · {len(items)} Treffer · {mode}")
-                if items:
-                    preview = pd.DataFrame(items)[["external_id", "title", "buyer", "publication_date"]]
-                    st.dataframe(preview, use_container_width=True, hide_index=True)
-            except Exception as e:
-                st.error("TED hat die Abfrage abgelehnt:")
-                st.code(str(e))
-    st.info("Die TED Search API ist für veröffentlichte Bekanntmachungen offen zugänglich. Expert Queries müssen aber exakt der TED-Syntax und den Code-Listen entsprechen.")
-
-with tab_watch:
-    st.subheader("⭐ Watchlist")
-    con = db()
-    watch = pd.read_sql_query(
-        """
-        SELECT t.* FROM tenders t
-        JOIN watchlist w ON w.source=t.source AND w.external_id=t.external_id
-        ORDER BY w.created_at DESC
-        """,
-        con,
-    )
-    con.close()
-    if watch.empty:
-        st.info("Noch keine Ausschreibungen gespeichert. Füge interessante Deals im Tab „Deal-Analyse“ hinzu.")
-    else:
-        rows = []
-        for _, rr in watch.iterrows():
-            b = rr.to_dict(); b.update(analyze(b, capital, markup, reserve_pct, include_kw, exclude_kw)); rows.append(b)
-        wdf = pd.DataFrame(rows).sort_values("Score", ascending=False)
-        for _, r in wdf.iterrows():
-            with st.expander(tender_label(r)):
-                render_opportunity(r, compact=True)
-                if r.get("url"):
-                    st.link_button("Original öffnen", r["url"], use_container_width=True)
-
-with tab_import:
-    st.subheader("Andere Vergabeportale importieren")
-    st.write("CSV/JSON-Exporte anderer Portale kannst du hier in denselben Deal-Scanner laden.")
-    source_name = st.text_input("Quellenname", value="Manueller Import")
-    uploaded = st.file_uploader("CSV oder JSON", type=["csv", "json"])
-    if uploaded is not None:
-        try:
-            if uploaded.name.lower().endswith(".csv"):
-                imp = pd.read_csv(uploaded)
+elif menu=="Scanner":
+    st.subheader("🔎 Live-Scanner")
+    st.caption("TED-EU-Ausschreibungen, Deutschland. Abgelaufene Fristen werden nach dem Abruf lokal verworfen.")
+    col1,col2=st.columns([1,1])
+    limit=col1.selectbox("Abrufmenge",[50,100,150,250],index=1)
+    if col2.button("🚀 Jetzt scannen",use_container_width=True,type="primary"):
+        with st.spinner("TED wird durchsucht …"):
+            data,q,err=scan_ted(limit)
+            if err: st.error("TED-Scan fehlgeschlagen: "+err)
             else:
-                raw = json.load(uploaded)
-                if isinstance(raw, dict):
-                    raw = raw.get("items") or raw.get("results") or raw.get("notices") or [raw]
-                imp = pd.DataFrame(raw)
-            st.dataframe(imp.head(15), use_container_width=True)
-            if st.button("Importieren & analysieren", use_container_width=True):
-                n, u = save_tenders(normalize_import(imp, source_name))
-                st.success(f"{n} neu · {u} aktualisiert")
-        except Exception as e:
-            st.error(f"Import nicht möglich: {e}")
+                # hard expiry filter before save only if deadline is recognized; unknown remains auditable.
+                new=save_tenders(data)
+                st.success(f"{len(data)} Bekanntmachungen geladen · {new} neu")
+                st.caption("Verwendete TED-Abfrage: "+q)
+                st.rerun()
+    st.markdown("### Suchfilter")
+    search=st.text_input("Produkt / Stichwort / Auftraggeber",placeholder="z. B. Werkzeug, Kabel, Drucker, Ersatzteile")
+    view=frows
+    if search:
+        ss=search.lower(); view=[r for r in view if ss in (r['title']+' '+r['description']+' '+r['buyer']+' '+r['cpv']).lower()]
+    st.write(f"**{len(view)} passende Ausschreibungen**")
+    for r in view[:50]:
+        a=r["_a"]
+        st.markdown(f"<div class='tsp-card'><b>{a['label']} · {a['score']}/100 — {r['title']}</b><br><span class='tsp-muted'>{r['buyer'] or '–'} · Wert {eur(r['estimated_value'])} · {'Frist unbekannt' if a['days'] is None else str(a['days'])+' Tage bis Frist'}</span></div>",unsafe_allow_html=True)
+        c1,c2=st.columns(2)
+        if c1.button("📂 Deal-Akte",key="d"+r["external_id"]): st.session_state.selected=(r["source"],r["external_id"]); st.session_state.page="Deals"; st.rerun()
+        if c2.button("⭐ Merken" if (r['source'],r['external_id']) not in wids else "★ Entfernen",key="w"+r["external_id"]): watch_toggle(r); st.rerun()
 
-    st.divider()
-    out = analyzed_df(capital, markup, reserve_pct, include_kw, exclude_kw)
-    if not out.empty:
-        export_cols = [
-            "source", "external_id", "title", "buyer", "publication_date", "deadline", "estimated_value",
-            "cpv", "Score", "Bewertung", "Geschätzter Einkauf €", "Geschätzter Rohertrag €",
-            "Finanzierungslücke €", "Pluspunkte", "Risiken", "url"
-        ]
-        csv = out[[c for c in export_cols if c in out.columns]].to_csv(index=False).encode("utf-8-sig")
-        st.download_button("⬇️ Analyse als CSV sichern", data=csv, file_name=f"tender_scout_{date.today().isoformat()}.csv", mime="text/csv", use_container_width=True)
+elif menu=="Deals":
+    st.subheader("📂 Deal-Akte")
+    if not rows: st.info("Noch keine Ausschreibungen gescannt.")
+    else:
+        choices={f"{r['title'][:75]} · {r['external_id']}":(r['source'],r['external_id']) for r in frows or rows}
+        labels=list(choices)
+        default=0
+        if st.session_state.selected:
+            for i,l in enumerate(labels):
+                if choices[l]==st.session_state.selected: default=i; break
+        label=st.selectbox("Ausschreibung",labels,index=default)
+        key=choices[label]; r=next(x for x in rows if (x['source'],x['external_id'])==key); a=analyze(r,capital,reserve,margin,max_ticket)
+        state_text="AKTIV" if a['state']=="active" else "FRIST UNBEKANNT" if a['state']=="unknown" else "ABGELAUFEN"
+        st.markdown(f"### {r['title']}")
+        st.caption(f"{r['buyer'] or 'Auftraggeber nicht erkannt'} · {r['external_id']} · {state_text}")
+        m1,m2,m3,m4=st.columns(4)
+        m1.metric("Deal-Score",f"{a['score']}/100",a['label'])
+        m2.metric("Ausschreibungswert",eur(r['estimated_value']))
+        m3.metric("Max. Einkauf*",eur(a['max_buy']))
+        m4.metric("Finanzierungslücke*",eur(a['funding']))
+        st.caption("*Rechenhilfe auf Basis des geschätzten Werts und deiner Zielmarge; kein garantierter Umsatz oder tatsächlicher Einkaufspreis.")
+        tab1,tab2,tab3,tab4=st.tabs(["📦 Produkt & Menge","💶 Umsatz & Kapital","🏭 Beschaffung","✅ Anforderungen"])
+        with tab1:
+            if a['products']:
+                st.success("Mengen-/Produktangaben im verfügbaren Text erkannt")
+                st.dataframe(pd.DataFrame(a['products']),use_container_width=True,hide_index=True)
+            else: st.warning("Keine belastbare Positionsmenge im TED-Kurztext erkannt. Originalunterlagen prüfen.")
+            if a['models']: st.write("**Erkannte Artikel-/Modellnummern:** "+", ".join(a['models']))
+            st.write("**CPV:**",r['cpv'] or "nicht erkannt")
+            st.text_area("TED-Beschreibung",r['description'] or "Keine Beschreibung geliefert",height=180,disabled=True)
+            if r['url']: st.link_button("🔗 Original auf TED öffnen",r['url'])
+        with tab2:
+            st.info("Der TED-Auftragswert ist ein Plan-/Schätzwert. Besonders bei Rahmenvereinbarungen ist er nicht automatisch dein Umsatz.")
+            if r['estimated_value']:
+                st.write(f"**Theoretisches Umsatzvolumen:** bis {eur(r['estimated_value'])} — nur falls dieser Wert tatsächlich deinem Los/Zuschlag entspricht.")
+                st.write(f"**Maximaler Einkauf bei {margin:.0f}% Ziel-Rohertrag:** {eur(a['max_buy'])}")
+                st.write(f"**Theoretischer Rohertrag:** {eur(a['gp'])}")
+                st.write(f"**Nutzbares Eigenkapital nach Reserve:** {eur(a['usable'])}")
+                if a['funding'] and a['funding']>0: st.error(f"Finanzierungslücke: {eur(a['funding'])}")
+                else: st.success("Nach dieser Grobkalkulation innerhalb deines Kapitals.")
+            else: st.warning("Kein belastbarer Auftragswert in den abgerufenen TED-Feldern.")
+        with tab3:
+            query=(a['models'][0] if a['models'] else (a['products'][0]['produkt'] if a['products'] else r['title']))[:120]
+            st.write("**Beschaffungssuche für:**",query)
+            for name,url in sourcing_links(query): st.link_button(name,url,use_container_width=True)
+            st.markdown("#### Echtes Lieferantenangebot kalkulieren")
+            unit=st.number_input("Einkaufspreis pro Einheit (€)",min_value=0.0,value=0.0,step=0.1,key="unit"+r['external_id'])
+            qty=st.number_input("Menge",min_value=1,value=int(a['products'][0]['menge']) if a['products'] else 1,step=1,key="qty"+r['external_id'])
+            freight=st.number_input("Fracht/Nebenkosten (€)",min_value=0.0,value=0.0,step=10.0,key="fr"+r['external_id'])
+            buy=unit*qty+freight
+            target_sell=buy/(1-margin/100) if margin<100 else 0
+            c1,c2,c3=st.columns(3); c1.metric("Einkauf gesamt",eur(buy)); c2.metric("Mindestverkauf bei Zielmarge",eur(target_sell)); c3.metric("Kapitaldifferenz",eur(max(0,buy-a['usable'])))
+        with tab4:
+            if a['requirements']:
+                for x in a['requirements']: st.markdown(f"<span class='tsp-badge'>{x}</span>",unsafe_allow_html=True)
+            else: st.info("Im Kurztext keine typischen Zusatzanforderungen erkannt. Vergabeunterlagen bleiben maßgeblich.")
+            checklist=["Leistungsbeschreibung vollständig gelesen","Mengen/Los eindeutig","Gleichwertigkeit / Marke geklärt","Lieferzeit bestätigt","Lieferantenangebot schriftlich","Fracht & Verpackung kalkuliert","Zahlungsziel / Vorfinanzierung geklärt","Eignungsnachweise vorhanden","Angebotsfrist geprüft"]
+            for i,x in enumerate(checklist): st.checkbox(x,key=f"ck-{r['external_id']}-{i}")
+        if st.button("⭐ Watchlist umschalten",use_container_width=True): watch_toggle(r); st.rerun()
 
-st.divider()
-st.caption(
-    "Tender Scout Pro · Voranalyse für frei handelbare B2B-Waren. Scores und Modellmargen ersetzen keine Prüfung der Vergabeunterlagen, Lieferfähigkeit, Steuern, Finanzierung oder rechtlichen Anforderungen. "
-    "Lokale Watchlist/History kann bei Streamlit-Neustarts verloren gehen; für dauerhaften Produktivbetrieb sollte später eine Cloud-Datenbank angebunden werden."
-)
+elif menu=="Watchlist":
+    st.subheader("⭐ Watchlist")
+    watchrows=[r for r in rows if (r['source'],r['external_id']) in wids]
+    if not watchrows:st.info("Noch keine Deals gespeichert.")
+    for r in watchrows:
+        a=analyze(r,capital,reserve,margin,max_ticket)
+        st.markdown(f"<div class='tsp-card'><b>{r['title']}</b><br><span class='tsp-muted'>{a['label']} · {a['score']}/100 · {eur(r['estimated_value'])}</span></div>",unsafe_allow_html=True)
+        if st.button("Öffnen",key="wo"+r['external_id']):st.session_state.selected=(r['source'],r['external_id']);st.session_state.page="Deals";st.rerun()
+
+elif menu=="Kalkulator":
+    st.subheader("🧮 Angebotskalkulator")
+    qty=st.number_input("Menge",1,1000000,100)
+    unit=st.number_input("EK je Einheit (€)",0.0,10000000.0,10.0,0.1)
+    freight=st.number_input("Fracht / Verpackung (€)",0.0,10000000.0,100.0,10.0)
+    extra=st.number_input("Sonstige Kosten (€)",0.0,10000000.0,0.0,10.0)
+    risk=st.slider("Risikopuffer %",0,30,5)
+    cost=qty*unit+freight+extra; cost_risk=cost*(1+risk/100); sale=cost_risk/(1-margin/100)
+    c1,c2,c3=st.columns(3); c1.metric("Gesamtkosten inkl. Puffer",eur(cost_risk)); c2.metric("Ziel-Angebot netto",eur(sale)); c3.metric("Rohertrag",eur(sale-cost_risk))
+    if cost_risk>max(0,capital-reserve): st.error(f"Vorfinanzierungslücke ca. {eur(cost_risk-max(0,capital-reserve))}")
+    else: st.success("Innerhalb deines eingestellten verfügbaren Kapitals.")
+
+elif menu=="Einstellungen":
+    st.subheader("⚙️ Einstellungen & Datensicherung")
+    st.write(f"**Version:** {APP_VERSION}")
+    st.write("Deine Kapital-/Marge-Einstellungen findest du im Seitenmenü oben links.")
+    st.download_button("⬇️ Daten-Backup herunterladen",backup_bytes(),file_name="tender-scout-backup.zip",mime="application/zip",use_container_width=True)
+    st.warning("Streamlit Community Cloud hat keinen garantierten dauerhaften lokalen Speicher. Für langfristige Nutzung sollte später eine Cloud-Datenbank angebunden werden. Bis dahin regelmäßig Backup herunterladen.")
+    st.markdown("### Datenqualität")
+    st.write("Tender Scout unterscheidet bewusst zwischen **erkannt**, **geschätzt** und **nicht bekannt**. Fehlende Positionsdaten werden nicht erfunden.")
+
+st.divider(); st.caption("Tender Scout Pro · Entscheidungsunterstützung für normale, frei handelbare B2B-Waren. Original-Vergabeunterlagen sind immer maßgeblich.")
