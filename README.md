@@ -1,15 +1,17 @@
-# Tender Scout Pro
+# Tender Scout Pro — Production
 
-Mobile-first Streamlit procurement cockpit for public procurement opportunities.
+Mobile-first Streamlit cockpit for analysing active German TED procurement notices.
 
 ## Deploy on Streamlit Community Cloud
-- Repository: your GitHub repo
+- Repository: your existing GitHub repository
 - Branch: `main`
-- Main file: `app.py`
+- Main file path: `app.py`
 
-## Files
-- `app.py`
-- `requirements.txt`
+## TED integration
+The app uses `POST https://api.ted.europa.eu/v3/notices/search`, query `buyer-country=DEU`, `scope=ACTIVE`, page-number pagination and an adaptive field fallback.
 
-## Notes
-The app uses the public TED Search API. It intentionally marks unknown data as unknown instead of inventing it. Estimated procurement values are not guaranteed revenue.
+## Important interpretation
+- An estimated procurement value is not guaranteed revenue.
+- A calculated max purchase price is a screening estimate, not a supplier quote.
+- Exact quantities/SKUs are shown only when present in the notice text.
+- Regulated weapons/ammunition/explosives are excluded from sourcing assistance.
