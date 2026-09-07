@@ -8,7 +8,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 
-APP_VERSION = "2026.09.07 Rebuild"
+APP_VERSION = "2026.09.07 Hotfix"
 TED_API = "https://api.ted.europa.eu/v3/notices/search"
 DB_PATH = Path("tender_scout.db")
 TODAY = date.today()
@@ -40,10 +40,44 @@ def defaults():
     for k,v in vals.items(): st.session_state.setdefault(k,v)
 defaults()
 
+def _table_columns(con, table):
+    try:
+        return {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    except sqlite3.Error:
+        return set()
+
 def db():
-    con=sqlite3.connect(DB_PATH)
+    """Open the local DB and self-heal schemas left behind by older app versions.
+
+    Streamlit Cloud keeps the working directory between some reruns/deploys, so an old
+    watchlist schema can survive a code update. CREATE TABLE IF NOT EXISTS does not
+    migrate columns, which caused the previous `no such column: pub` crash.
+    """
+    con=sqlite3.connect(DB_PATH, timeout=10)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=5000")
+
+    wanted_watch={"pub","title","buyer","added","payload"}
+    existing=_table_columns(con,"watchlist")
+    if existing and not wanted_watch.issubset(existing):
+        # Preserve the incompatible table for manual recovery, but keep the app usable.
+        stamp=datetime.now().strftime("%Y%m%d%H%M%S")
+        try:
+            con.execute(f"ALTER TABLE watchlist RENAME TO watchlist_legacy_{stamp}")
+        except sqlite3.Error:
+            con.execute("DROP TABLE IF EXISTS watchlist")
     con.execute("CREATE TABLE IF NOT EXISTS watchlist(pub TEXT PRIMARY KEY,title TEXT,buyer TEXT,added TEXT,payload TEXT)")
+
+    wanted_quotes={"id","pub","supplier","buy","shipping","sell","note","created"}
+    existing_q=_table_columns(con,"quotes")
+    if existing_q and not wanted_quotes.issubset(existing_q):
+        stamp=datetime.now().strftime("%Y%m%d%H%M%S")
+        try:
+            con.execute(f"ALTER TABLE quotes RENAME TO quotes_legacy_{stamp}")
+        except sqlite3.Error:
+            con.execute("DROP TABLE IF EXISTS quotes")
     con.execute("CREATE TABLE IF NOT EXISTS quotes(id INTEGER PRIMARY KEY AUTOINCREMENT,pub TEXT,supplier TEXT,buy REAL,shipping REAL,sell REAL,note TEXT,created TEXT)")
+    con.commit()
     return con
 
 # ---------------- generic parsers ----------------
@@ -110,8 +144,14 @@ def nature(n):
 def value_info(n):
     cur=first(n.get("total-value-cur") or n.get("estimated-value-cur-lot") or n.get("estimated-value-cur-proc"),"EUR")
     for key,label in [("total-value","Veröffentlichter Gesamtwert"),("estimated-value-lot","Geschätzter Loswert"),("estimated-value-proc","Geschätzter Verfahrenswert")]:
-        xs=num(n.get(key))
-        if xs:return max(xs),cur,label
+        xs=[x for x in num(n.get(key)) if x is not None and x > 0]
+        if xs:
+            v=max(xs)
+            # TED notices sometimes contain symbolic/placeholder values such as 1 EUR.
+            # Never use those for revenue/capital calculations.
+            if v <= 1:
+                return None,cur,"Wert unplausibel/Platzhalter – nicht für Kalkulation verwendet"
+            return v,cur,label
     return None,cur,"Kein belastbarer Wert veröffentlicht"
 
 # ---------------- TED ----------------
