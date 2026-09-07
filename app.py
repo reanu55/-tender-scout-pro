@@ -1,472 +1,393 @@
-import streamlit as st
-import requests, re, json, math, sqlite3, urllib.parse
-from datetime import datetime, date, timezone
+import io, json, re, sqlite3, urllib.parse
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-import pandas as pd
 
-APP_VERSION = "2026.09 Production"
-TED_URL = "https://api.ted.europa.eu/v3/notices/search"
+import pandas as pd
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
+from pypdf import PdfReader
+
+APP_VERSION = "2026.09.07 Rebuild"
+TED_API = "https://api.ted.europa.eu/v3/notices/search"
 DB_PATH = Path("tender_scout.db")
+TODAY = date.today()
 
 st.set_page_config(page_title="Tender Scout Pro", page_icon="📦", layout="wide", initial_sidebar_state="collapsed")
 
-# ---------- visual system ----------
-st.markdown(r"""
+st.markdown("""
 <style>
-:root{--bg:#07111f;--card:#0e1b2d;--card2:#101f34;--line:#24364e;--muted:#91a1b8;--gold:#f3c75f;--good:#35d07f;--warn:#ffb84d;--bad:#ff6577;--white:#f7f9fc;}
-.stApp{background:linear-gradient(180deg,#07111f 0%,#091521 55%,#08111b 100%);color:var(--white)}
-.block-container{padding-top:.8rem;padding-bottom:5rem;max-width:1180px}
+:root{--bg:#07111f;--card:#0d1a2b;--line:#223751;--muted:#8ea0b8;--gold:#e9bd55;--good:#31ce79;--warn:#ffb84a;--bad:#ff6677;--white:#f6f8fb}
+.stApp{background:linear-gradient(180deg,#07111f,#08131f 65%,#06101a);color:var(--white)}
+.block-container{max-width:1180px;padding-top:.8rem;padding-bottom:5rem}
 #MainMenu,footer,header{visibility:hidden}.stDeployButton{display:none}
-h1,h2,h3{letter-spacing:-.02em}.muted{color:var(--muted)}
-.brand{display:flex;align-items:center;gap:12px;margin:2px 0 14px}.brandlogo{width:46px;height:46px;border-radius:14px;background:linear-gradient(145deg,#18324f,#0a1727);display:flex;align-items:center;justify-content:center;border:1px solid #294663;font-size:25px;box-shadow:0 12px 30px #0005}.brandtitle{font-weight:800;font-size:1.35rem}.brandsub{color:#8da0b8;font-size:.8rem}
-.hero{background:linear-gradient(135deg,#10243c 0%,#0a1728 60%,#152339 100%);border:1px solid #29415e;border-radius:22px;padding:22px;margin-bottom:16px;box-shadow:0 16px 38px #0004}.hero h1{margin:0;font-size:2rem}.hero p{color:#9aabc0;margin:.45rem 0 0}
-.kpi{background:#0d1b2c;border:1px solid #223951;border-radius:17px;padding:15px 15px 13px;min-height:100px}.kpi-label{font-size:.78rem;color:#8ea1b8}.kpi-value{font-size:1.55rem;font-weight:800;margin-top:5px}.kpi-sub{font-size:.76rem;color:#6f839c;margin-top:3px}
-.card{background:linear-gradient(160deg,#0d1b2c,#0a1625);border:1px solid #20364d;border-radius:18px;padding:16px;margin:10px 0}.deal{border-left:4px solid #4f7faf}.deal.good{border-left-color:#35d07f}.deal.warn{border-left-color:#ffb84d}.deal.bad{border-left-color:#ff6577}
-.badge{display:inline-block;padding:4px 9px;border-radius:999px;font-size:.72rem;font-weight:700;border:1px solid #304760;background:#11243a;margin:2px 5px 2px 0}.badge.good{color:#5fe49a;border-color:#276a49;background:#0e2b20}.badge.warn{color:#ffc76d;border-color:#72502a;background:#2e2414}.badge.bad{color:#ff8190;border-color:#71343f;background:#30171d}.badge.gold{color:#f5ce71;border-color:#66542b;background:#2c2617}
-.big-score{width:72px;height:72px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.45rem;font-weight:900;border:5px solid #34536e;background:#091727}
-.label{font-size:.76rem;color:#8fa2b9;text-transform:uppercase;letter-spacing:.06em}.value{font-weight:700;margin-top:2px}.divider{height:1px;background:#1e3349;margin:12px 0}
-.nav-note{font-size:.74rem;color:#72859e;text-align:center;margin-top:18px}
-.stButton>button{border-radius:13px!important;min-height:44px;font-weight:700}.stTextInput input,.stNumberInput input,.stSelectbox div[data-baseweb="select"]>div{border-radius:12px!important}
-[data-testid="stExpander"]{background:#0b1929;border:1px solid #21364c;border-radius:14px}
-[data-testid="stMetric"]{background:#0d1b2c;border:1px solid #223951;border-radius:15px;padding:10px}
-.stTabs [data-baseweb="tab-list"]{gap:4px;background:#091625;padding:5px;border-radius:14px}.stTabs [data-baseweb="tab"]{border-radius:10px;height:42px}
-@media(max-width:700px){.block-container{padding-left:.75rem;padding-right:.75rem}.hero{padding:17px}.hero h1{font-size:1.55rem}.brandtitle{font-size:1.15rem}.kpi{min-height:88px}.kpi-value{font-size:1.3rem}}
+.hero{background:linear-gradient(135deg,#10243b,#0a1727 65%,#132236);border:1px solid #29425e;border-radius:22px;padding:20px;margin-bottom:14px;box-shadow:0 15px 38px #0005}
+.hero h1{margin:0;font-size:1.9rem}.hero p{color:#9caec2;margin:.45rem 0 0}
+.brand{display:flex;align-items:center;gap:11px;margin-bottom:12px}.logo{width:44px;height:44px;border-radius:13px;background:#10233a;border:1px solid #2a4562;display:flex;align-items:center;justify-content:center;font-size:24px}.bt{font-weight:850;font-size:1.3rem}.bs{font-size:.77rem;color:#879bb5}
+.kpi{background:#0d1a2b;border:1px solid #223751;border-radius:16px;padding:14px;min-height:92px}.kl{font-size:.73rem;color:#8fa2b9;text-transform:uppercase}.kv{font-size:1.45rem;font-weight:850;margin-top:4px}.ks{font-size:.73rem;color:#73879f}
+.card{background:linear-gradient(160deg,#0d1b2d,#091522);border:1px solid #213850;border-radius:18px;padding:16px;margin:10px 0}.good{border-left:4px solid #31ce79}.warn{border-left:4px solid #ffb84a}.bad{border-left:4px solid #ff6677}
+.badge{display:inline-block;border:1px solid #304860;background:#102339;border-radius:999px;padding:4px 9px;font-size:.7rem;font-weight:750;margin:1px 4px 1px 0}.bg{color:#61e69c;border-color:#266c49;background:#0c2b1e}.bw{color:#ffc873;border-color:#745128;background:#2d2313}.bb{color:#ff8793;border-color:#6e3440;background:#2d171d}.gold{color:#f1cb70;border-color:#65532e;background:#2b2516}
+.muted{color:#8da0b7}.label{font-size:.72rem;color:#8498b0;text-transform:uppercase}.value{font-weight:750}.divider{height:1px;background:#20354b;margin:12px 0}
+.stButton>button{border-radius:13px!important;min-height:44px;font-weight:750}.stTextInput input,.stNumberInput input{border-radius:12px!important}
+[data-testid="stExpander"]{background:#0b1928;border:1px solid #21364c;border-radius:14px}
+@media(max-width:700px){.block-container{padding-left:.7rem;padding-right:.7rem}.hero{padding:16px}.hero h1{font-size:1.55rem}.bt{font-size:1.12rem}.kpi{min-height:82px}.kv{font-size:1.25rem}}
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- helpers ----------
-def init_state():
-    defaults = {
-        "nav":"Dashboard", "capital":2000.0, "reserve":500.0, "target_margin":22.0,
-        "scan_limit":100, "notices":[], "scan_error":None, "last_scan":None,
-        "hide_unknown_deadline":False, "min_days":1, "keyword":"", "selected":None,
-        "only_supplies":True, "min_score":0
-    }
-    for k,v in defaults.items():
-        st.session_state.setdefault(k,v)
-init_state()
+# ---------------- state / db ----------------
+def defaults():
+    vals={"nav":"Dashboard","capital":2000.0,"reserve":500.0,"margin":22.0,"notices":[],"last_scan":None,"scan_error":None,"selected":None,"keyword":"","min_days":5,"max_age":120,"scan_limit":75,"min_score":0,"strict_deadline":True}
+    for k,v in vals.items(): st.session_state.setdefault(k,v)
+defaults()
 
 def db():
     con=sqlite3.connect(DB_PATH)
-    con.execute("CREATE TABLE IF NOT EXISTS watchlist(pub TEXT PRIMARY KEY, title TEXT, buyer TEXT, note TEXT, added TEXT, payload TEXT)")
-    con.execute("CREATE TABLE IF NOT EXISTS quotes(id INTEGER PRIMARY KEY AUTOINCREMENT, pub TEXT, supplier TEXT, buy_price REAL, shipping REAL, sell_price REAL, note TEXT, created TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS watchlist(pub TEXT PRIMARY KEY,title TEXT,buyer TEXT,added TEXT,payload TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS quotes(id INTEGER PRIMARY KEY AUTOINCREMENT,pub TEXT,supplier TEXT,buy REAL,shipping REAL,sell REAL,note TEXT,created TEXT)")
     return con
 
-def first_scalar(v, default="—"):
-    if v is None: return default
-    if isinstance(v, dict):
+# ---------------- generic parsers ----------------
+def first(v, default="—"):
+    if v is None:return default
+    if isinstance(v,dict):
         for lang in ("deu","ger","eng"):
-            x=v.get(lang)
-            if x:
-                return first_scalar(x, default)
+            if lang in v and v[lang]: return first(v[lang],default)
         for x in v.values():
-            if x: return first_scalar(x, default)
+            if x:return first(x,default)
         return default
-    if isinstance(v, list):
-        if not v:return default
-        return first_scalar(v[0], default)
+    if isinstance(v,list): return first(v[0],default) if v else default
     return str(v)
 
-def all_text(v)->str:
+def text(v):
     if v is None:return ""
-    if isinstance(v, dict):return " ".join(all_text(x) for x in v.values())
-    if isinstance(v, list):return " ".join(all_text(x) for x in v)
+    if isinstance(v,dict):return " ".join(text(x) for x in v.values())
+    if isinstance(v,list):return " ".join(text(x) for x in v)
     return str(v)
 
-def money(v, currency="EUR"):
-    try:
-        x=float(str(v).replace(" ","").replace(",","."))
-        return f"{x:,.0f} {currency}".replace(",",".")
+def to_date(v):
+    if not v:return None
+    if isinstance(v,(list,tuple)):
+        ds=[to_date(x) for x in v]; ds=[x for x in ds if x]
+        future=[x for x in ds if x>=TODAY]
+        return min(future) if future else (max(ds) if ds else None)
+    s=str(v).strip()[:10]
+    for f in ("%Y-%m-%d","%Y%m%d","%d.%m.%Y"):
+        try:return datetime.strptime(s,f).date()
+        except:pass
+    return None
+
+def num(v):
+    vals=[]
+    if isinstance(v,list):
+        for x in v: vals+=num(x)
+    elif isinstance(v,dict):
+        for x in v.values(): vals+=num(x)
+    elif v is not None:
+        try: vals.append(float(str(v).replace(" ","").replace(",",".")))
+        except: pass
+    return vals
+
+def money(v,cur="EUR"):
+    if v is None:return "nicht angegeben"
+    try:return f"{float(v):,.0f} {cur}".replace(",",".")
     except:return "nicht angegeben"
 
-def numeric_values(v)->List[float]:
-    out=[]
-    if v is None:return out
-    if isinstance(v,list):
-        for x in v: out+=numeric_values(x)
-    elif isinstance(v,dict):
-        for x in v.values(): out+=numeric_values(x)
-    else:
-        try: out.append(float(str(v).replace(" ","").replace(",",".")))
-        except: pass
-    return out
+def pub_year(n):
+    p=first(n.get("publication-number"),"")
+    m=re.search(r"-(20\d{2})$",p)
+    return int(m.group(1)) if m else None
 
-def parse_date_any(v)->Optional[date]:
-    if not v:return None
-    vals=v if isinstance(v,list) else [v]
-    parsed=[]
-    for x in vals:
-        s=str(x)[:10]
-        for fmt in ("%Y-%m-%d","%Y%m%d","%d.%m.%Y"):
-            try: parsed.append(datetime.strptime(s,fmt).date()); break
-            except: pass
-    future=[d for d in parsed if d>=date.today()]
-    return min(future) if future else (max(parsed) if parsed else None)
+def publication_date(n): return to_date(n.get("publication-date"))
+def deadline(n): return to_date(n.get("deadline") or n.get("deadline-receipt-tender-date-lot") or n.get("deadline-date-lot"))
 
-def deadline_info(n):
-    d=parse_date_any(n.get("deadline-receipt-tender-date-lot") or n.get("deadline-date-lot") or n.get("deadline"))
-    if not d:return None,None,"Unbekannt"
-    days=(d-date.today()).days
-    status="Offen" if days>=0 else "Abgelaufen"
-    return d,days,status
+def nature(n):
+    x=text(n.get("contract-nature")).lower()
+    if "suppl" in x:return "Lieferung"
+    if "service" in x:return "Dienstleistung"
+    if "work" in x:return "Bauleistung"
+    return first(n.get("contract-nature"),"Nicht klassifiziert")
 
-def proc_value(n)->Tuple[Optional[float],str,str]:
-    cur=first_scalar(n.get("estimated-value-cur-proc") or n.get("estimated-value-cur-lot"),"EUR")
-    lot=numeric_values(n.get("estimated-value-lot"))
-    proc=numeric_values(n.get("estimated-value-proc"))
-    if lot:
-        return max(lot),cur,"Loswert (Schätzung)"
-    if proc:
-        return max(proc),cur,"Verfahrenswert (Schätzung)"
-    return None,cur,"Kein Wert veröffentlicht"
+def value_info(n):
+    cur=first(n.get("total-value-cur") or n.get("estimated-value-cur-lot") or n.get("estimated-value-cur-proc"),"EUR")
+    for key,label in [("total-value","Veröffentlichter Gesamtwert"),("estimated-value-lot","Geschätzter Loswert"),("estimated-value-proc","Geschätzter Verfahrenswert")]:
+        xs=num(n.get(key))
+        if xs:return max(xs),cur,label
+    return None,cur,"Kein belastbarer Wert veröffentlicht"
 
-def contract_kind(n):
-    t=all_text(n.get("contract-nature") or n.get("contract-nature-main-proc") or n.get("contract-nature-main-lot")).lower()
-    if "suppl" in t or "liefer" in t:return "Lieferung"
-    if "service" in t or "dienst" in t:return "Dienstleistung"
-    if "work" in t or "bau" in t:return "Bauleistung"
-    return "Nicht klassifiziert"
+# ---------------- TED ----------------
+# Minimal fields are deliberately based on fields currently documented/observed for Search API.
+BASE_FIELDS=["publication-number","notice-title","notice-type","buyer-name","buyer-country","contract-nature","classification-cpv","total-value","total-value-cur","publication-date","deadline","links"]
 
-BLOCKED = ["munition","ammunition","firearm","weapon","waffe","sprengstoff","explosive","missile","rakete","torpedo","mortar","gewehr","pistole","mine ","artillery"]
-HARD = ["sicherheitsüberprüfung","security clearance","geheimschutz","bankbürgschaft","performance bond","referenzen der letzten","iso 27001","nato secret"]
-GOOD = ["verbrauchsmaterial","werkzeug","kabel","stecker","drucker","toner","papier","möbel","leuchte","lampe","reinigung","ersatzteil","lager","schraube","elektro","it-zubehör","computer","monitor","textil","büromaterial","messgerät"]
+class TEDException(Exception): pass
 
-def safety_flags(text):
-    low=text.lower()
-    return [x for x in BLOCKED if x in low]
-
-def extract_product_intel(n):
-    title=first_scalar(n.get("notice-title"),"")
-    desc=" ".join([all_text(n.get("description-proc")),all_text(n.get("description-lot"))]).strip()
-    text=(title+" "+desc).strip()
-    quantities=[]
-    patterns=[r'(?<!\d)(\d{1,6}(?:[.,]\d+)?)\s*(Stück|Stk\.?|pcs\.?|Einheiten|units|Packungen|Sets|Sätze|Meter|m\b)', r'(?:Menge|quantity)\s*[:\-]?\s*(\d{1,6}(?:[.,]\d+)?)']
-    for p in patterns:
-        for m in re.finditer(p,text,re.I):
-            quantities.append(m.group(0).strip())
-    article=[]
-    for p in [r'(?:Artikel(?:nummer)?|Art\.?\s*-?Nr\.?|Modell|Model|Typ|Type|Part\s*No\.?|SKU)\s*[:#\-]?\s*([A-Z0-9][A-Z0-9._/\-]{2,})',r'\b[A-Z]{2,5}-\d{3,8}(?:-[A-Z0-9]{1,6})?\b']:
-        article += [m.group(1) if m.lastindex else m.group(0) for m in re.finditer(p,text,re.I)]
-    cpvs=n.get("classification-cpv") or []
-    if not isinstance(cpvs,list):cpvs=[cpvs]
-    # Product label: title is most reliable; do not fabricate exact SKU
-    return {"title":title or "Produkt aus TED-Titel nicht ermittelbar","description":desc[:3500],"quantities":list(dict.fromkeys(quantities))[:12],"articles":list(dict.fromkeys(article))[:12],"cpv":[str(x) for x in cpvs][:12]}
-
-def score_notice(n, capital, reserve, target_margin):
-    intel=extract_product_intel(n); text=(intel["title"]+" "+intel["description"]).lower()
-    if safety_flags(text): return 0,["Regulierte/ausgeschlossene Güter erkannt"],"NO-GO"
-    score=48; reasons=[]
-    d,days,status=deadline_info(n)
-    if status=="Abgelaufen":return 0,["Angebotsfrist abgelaufen"],"NO-GO"
-    if days is None: score-=12; reasons.append("Frist nicht strukturiert veröffentlicht")
-    elif days>=21: score+=10; reasons.append(f"{days} Tage Vorlauf")
-    elif days>=10: score+=5
-    elif days<5: score-=15; reasons.append("Sehr kurze Restfrist")
-    kind=contract_kind(n)
-    if kind=="Lieferung":score+=12;reasons.append("Waren-/Lieferauftrag")
-    elif kind=="Dienstleistung":score-=8
-    val,cur,src=proc_value(n)
-    usable=max(0,capital-reserve)
-    if val:
-        max_buy=val*(1-target_margin/100)
-        if max_buy<=usable:score+=18;reasons.append("Theoretisch aus Eigenkapital finanzierbar")
-        elif max_buy<=usable*2:score+=5;reasons.append("Moderate Finanzierungslücke")
-        elif max_buy>usable*8:score-=18;reasons.append("Hohe Vorfinanzierung")
-    else: score-=5;reasons.append("Kein Auftragswert veröffentlicht")
-    if any(k in text for k in GOOD):score+=9;reasons.append("Gut beschaffbare Handelsware erkannt")
-    hard=[k for k in HARD if k in text]
-    if hard:score-=min(20,7*len(hard));reasons.append("Zusätzliche Eignungs-/Sicherheitsanforderungen")
-    if intel["quantities"]:score+=5;reasons.append("Menge im Text erkannt")
-    score=max(0,min(100,score))
-    grade="GO" if score>=72 else "PRÜFEN" if score>=45 else "NO-GO"
-    return score,reasons,grade
-
-# ---------- TED client ----------
-CORE_FIELDS=["publication-number","publication-date","notice-title","buyer-name","buyer-country","contract-nature","classification-cpv","deadline-receipt-tender-date-lot"]
-DETAIL_FIELDS=CORE_FIELDS+["description-proc","description-lot","quantity-lot","quantity-unit-lot","estimated-value-proc","estimated-value-cur-proc","estimated-value-lot","estimated-value-cur-lot","submission-url-lot","selection-criterion-name-lot","selection-criterion-description-lot","framework-agreement-lot","framework-maximum-value-lot","framework-maximum-value-cur-lot"]
-MIN_FIELDS=["publication-number","notice-title","buyer-name","publication-date"]
-
-def ted_post(fields, limit=100, query="buyer-country=DEU"):
-    payload={"query":query,"fields":fields,"page":1,"limit":int(limit),"scope":"ACTIVE","checkQuerySyntax":False,"paginationMode":"PAGE_NUMBER","onlyLatestVersions":True}
-    r=requests.post(TED_URL,json=payload,headers={"Accept":"application/json","Content-Type":"application/json","User-Agent":"TenderScoutPro/1.0"},timeout=35)
-    if r.status_code!=200:
-        msg=r.text[:1200]
-        raise RuntimeError(f"TED HTTP {r.status_code}: {msg}")
-    data=r.json()
-    return data.get("notices",[]), data
-
-def scan_ted(limit):
-    errors=[]
-    for fields in (DETAIL_FIELDS,CORE_FIELDS,MIN_FIELDS):
-        try:
-            notices,meta=ted_post(fields,limit)
-            return notices,meta,errors,fields
-        except Exception as e: errors.append(str(e))
-    raise RuntimeError(" | ".join(errors))
-
-def fetch_detail(pub):
+def ted_search(limit=75,max_age=120,keyword=""):
+    start=(TODAY-timedelta(days=max_age)).strftime("%Y%m%d")
+    parts=["buyer-country=DEU",f"PD>={start}"]
+    if keyword.strip():
+        safe=keyword.strip().replace('"','')[:90]
+        parts.append(f'FT~"{safe}"')
+    query=" AND ".join(parts)+" SORT BY publication-date DESC"
+    # Keep request intentionally small: this matches the current public API examples.
+    payload={"query":query,"fields":BASE_FIELDS,"limit":min(int(limit),100),"scope":"ACTIVE","paginationMode":"ITERATION"}
     try:
-        notices,meta=ted_post(DETAIL_FIELDS,1,f"publication-number={pub}")
-        return notices[0] if notices else None,None
-    except Exception as e:
-        try:
-            notices,meta=ted_post(CORE_FIELDS,1,f"publication-number={pub}")
-            return notices[0] if notices else None,str(e)
-        except Exception as e2:return None,f"{e} | {e2}"
+        r=requests.post(TED_API,json=payload,headers={"Content-Type":"application/json","Accept":"application/json"},timeout=35)
+    except requests.RequestException as e:
+        raise TEDException(f"Netzwerkfehler: {e}")
+    if r.status_code!=200:
+        raise TEDException(f"TED HTTP {r.status_code}: {r.text[:1800]}")
+    try:data=r.json()
+    except Exception:raise TEDException("TED lieferte keine gültige JSON-Antwort.")
+    notices=data.get("notices") or []
+    return notices,data,query
 
-# ---------- calculations / sourcing ----------
-def deal_finance(n, capital, reserve, margin):
-    val,cur,src=proc_value(n); usable=max(0,capital-reserve)
-    if not val:return {"revenue":None,"max_buy":None,"gross":None,"gap":None,"usable":usable,"currency":cur,"source":src}
-    max_buy=val*(1-margin/100);gross=val-max_buy;gap=max(0,max_buy-usable)
-    return {"revenue":val,"max_buy":max_buy,"gross":gross,"gap":gap,"usable":usable,"currency":cur,"source":src}
+def hard_validate(n,max_age,strict_deadline=True):
+    # 1) reject impossible/archive years regardless of TED scope
+    y=pub_year(n)
+    if y and y < TODAY.year-1:return False,"Archivjahr"
+    # 2) publication freshness
+    pd=publication_date(n)
+    if not pd:return False,"Kein Publikationsdatum"
+    if pd < TODAY-timedelta(days=max_age):return False,"Zu alt"
+    if pd > TODAY+timedelta(days=2):return False,"Ungültiges Publikationsdatum"
+    # 3) only supplies for this business model
+    if nature(n)!="Lieferung":return False,"Keine Lieferung"
+    # 4) real open deadline; strict mode removes planning/results/no-deadline notices
+    d=deadline(n)
+    if d is None and strict_deadline:return False,"Keine Angebotsfrist"
+    if d and d < TODAY:return False,"Frist abgelaufen"
+    return True,"OK"
 
-def procurement_queries(n):
-    intel=extract_product_intel(n)
-    title=intel["title"]
-    query=(intel["articles"][0] if intel["articles"] else title)[:130]
-    q=urllib.parse.quote_plus(query)
-    return [
-        ("Google B2B",f"https://www.google.com/search?q={q}+Gro%C3%9Fhandel+B2B+Deutschland"),
-        ("Unite / Mercateo",f"https://www.google.com/search?q=site%3Aunite.eu+{q}"),
-        ("RS",f"https://www.google.com/search?q=site%3Ade.rs-online.com+{q}"),
-        ("Conrad",f"https://www.google.com/search?q=site%3Aconrad.de+{q}"),
-        ("Farnell",f"https://www.google.com/search?q=site%3Ade.farnell.com+{q}"),
-        ("Distrelec",f"https://www.google.com/search?q=site%3Adistrelec.de+{q}"),
-        ("Würth",f"https://www.google.com/search?q=site%3Awuerth.de+{q}"),
-    ]
+# ---------------- product / risk ----------------
+BLOCKED=["munition","ammunition","firearm","weapon","waffe","sprengstoff","explosive","missile","rakete","torpedo","gewehr","pistole","mine ","artillery"]
+GOOD=["werkzeug","kabel","stecker","drucker","toner","papier","möbel","leuchte","lampe","reinigung","ersatzteil","schraube","elektro","computer","monitor","textil","büromaterial","messgerät","lagerbedarf","verbrauchsmaterial"]
+HARD=["sicherheitsüberprüfung","security clearance","geheimschutz","bankbürgschaft","performance bond","iso 27001","referenzen"]
 
-def notice_url(pub):return f"https://ted.europa.eu/de/notice/-/detail/{pub}"
+def product_intel(n,extra_text=""):
+    title=first(n.get("notice-title"),"Ohne Titel")
+    blob=" ".join([title,text(n.get("description-lot")),text(n.get("description-proc")),extra_text]).strip()
+    quantities=[]
+    for p in [r'(?<!\d)(\d{1,7}(?:[.,]\d+)?)\s*(Stück|Stk\.?|pcs\.?|Einheiten|units|Packungen|Sets|Sätze|Meter|kg|Liter)',r'(?:Menge|Quantity)\s*[:\-]?\s*(\d{1,7}(?:[.,]\d+)?)']:
+        quantities += [m.group(0).strip() for m in re.finditer(p,blob,re.I)]
+    articles=[]
+    for p in [r'(?:Artikel(?:nummer)?|Art\.?\s*-?Nr\.?|Modell|Model|Typ|Type|Part\s*No\.?|SKU)\s*[:#\-]?\s*([A-Z0-9][A-Z0-9._/\-]{2,})',r'\b[A-Z]{2,6}-\d{3,10}(?:-[A-Z0-9]{1,8})?\b']:
+        articles += [m.group(1) if m.lastindex else m.group(0) for m in re.finditer(p,blob,re.I)]
+    cpv=n.get("classification-cpv") or []
+    if not isinstance(cpv,list):cpv=[cpv]
+    return {"title":title,"blob":blob,"quantities":list(dict.fromkeys(quantities))[:20],"articles":list(dict.fromkeys(articles))[:20],"cpv":[str(x) for x in cpv][:20]}
 
-def watch_add(n):
-    pub=first_scalar(n.get("publication-number"),"")
-    if not pub:return
-    with db() as con:
-        con.execute("INSERT OR REPLACE INTO watchlist(pub,title,buyer,note,added,payload) VALUES(?,?,?,?,?,?)",(pub,first_scalar(n.get("notice-title"),""),first_scalar(n.get("buyer-name"),""),"",datetime.now().isoformat(timespec="seconds"),json.dumps(n,ensure_ascii=False)))
+def score(n,capital,reserve,margin,extra_text=""):
+    intel=product_intel(n,extra_text); low=intel["blob"].lower(); reasons=[]
+    if any(x in low for x in BLOCKED):return 0,"NO-GO",["Regulierte/ausgeschlossene Güter erkannt"]
+    s=55
+    d=deadline(n); days=(d-TODAY).days if d else None
+    if days is not None:
+        if days>=21:s+=12;reasons.append(f"{days} Tage Restlaufzeit")
+        elif days>=10:s+=7
+        elif days<5:s-=18;reasons.append("Sehr kurze Restlaufzeit")
+    val,cur,src=value_info(n); usable=max(0,capital-reserve)
+    if val:
+        maxbuy=val*(1-margin/100)
+        if maxbuy<=usable:s+=18;reasons.append("Kapitalfilter passt")
+        elif maxbuy<=usable*2:s+=4;reasons.append("Moderate Finanzierungslücke")
+        elif maxbuy>usable*8:s-=18;reasons.append("Hohe Vorfinanzierung")
+    else:s-=5;reasons.append("Kein Wert veröffentlicht")
+    if any(x in low for x in GOOD):s+=8;reasons.append("Gut beschaffbare Handelsware")
+    if intel["quantities"]:s+=5;reasons.append("Menge erkannt")
+    if intel["articles"]:s+=4;reasons.append("Artikel/Typ erkannt")
+    if any(x in low for x in HARD):s-=12;reasons.append("Eignungs-/Sicherheitsanforderung möglich")
+    s=max(0,min(100,s)); grade="GO" if s>=72 else "PRÜFEN" if s>=45 else "NO-GO"
+    return s,grade,reasons
 
-def watch_remove(pub):
-    with db() as con:con.execute("DELETE FROM watchlist WHERE pub=?",(pub,))
+# ---------------- document analysis ----------------
+def pdf_text(upload):
+    try:
+        reader=PdfReader(upload)
+        return "\n".join((p.extract_text() or "") for p in reader.pages)[:200000]
+    except Exception as e:return ""
 
-def watched(pub):
+def fetch_ted_html(pub):
+    url=f"https://ted.europa.eu/de/notice/{pub}/html"
+    try:
+        r=requests.get(url,headers={"User-Agent":"Mozilla/5.0"},timeout=25)
+        if r.status_code!=200:return "",f"HTTP {r.status_code}"
+        soup=BeautifulSoup(r.text,"html.parser")
+        for x in soup(["script","style","noscript"]):x.decompose()
+        return " ".join(soup.stripped_strings)[:150000],None
+    except Exception as e:return "",str(e)
+
+# ---------------- watchlist ----------------
+def is_watched(pub):
     with db() as con:return con.execute("SELECT 1 FROM watchlist WHERE pub=?",(pub,)).fetchone() is not None
 
-def save_quote(pub,supplier,buy,shipping,sell,note):
-    with db() as con:con.execute("INSERT INTO quotes(pub,supplier,buy_price,shipping,sell_price,note,created) VALUES(?,?,?,?,?,?,?)",(pub,supplier,buy,shipping,sell,note,datetime.now().isoformat(timespec="seconds")))
+def add_watch(n):
+    pub=first(n.get("publication-number"),"")
+    with db() as con:con.execute("INSERT OR REPLACE INTO watchlist(pub,title,buyer,added,payload) VALUES(?,?,?,?,?)",(pub,first(n.get("notice-title"),""),first(n.get("buyer-name"),""),datetime.now().isoformat(timespec="seconds"),json.dumps(n,ensure_ascii=False)))
 
-def load_quotes(pub):
-    with db() as con:return pd.read_sql_query("SELECT supplier,buy_price,shipping,sell_price,note,created FROM quotes WHERE pub=? ORDER BY id DESC",con,params=(pub,))
+def remove_watch(pub):
+    with db() as con:con.execute("DELETE FROM watchlist WHERE pub=?",(pub,))
 
-# ---------- header / navigation ----------
-st.markdown('<div class="brand"><div class="brandlogo">📦</div><div><div class="brandtitle">Tender Scout Pro</div><div class="brandsub">Beschaffungs-Cockpit · Deutschland · EU TED</div></div></div>',unsafe_allow_html=True)
-navcols=st.columns(6)
-for c,label,ico in zip(navcols,["Dashboard","Scanner","Deal-Akte","Watchlist","Kalkulator","Einstellungen"],["⌂","⌕","▤","★","€","⚙"]):
+# ---------------- UI ----------------
+st.markdown('<div class="brand"><div class="logo">📦</div><div><div class="bt">Tender Scout Pro</div><div class="bs">Live Procurement Cockpit · Germany · TED</div></div></div>',unsafe_allow_html=True)
+navs=[("Dashboard","⌂"),("Scanner","⌕"),("Deal-Akte","▤"),("Watchlist","★"),("Kalkulator","€"),("Einstellungen","⚙")]
+cols=st.columns(len(navs))
+for c,(name,ico) in zip(cols,navs):
     with c:
-        if st.button(f"{ico} {label}",use_container_width=True,key=f"nav_{label}"):
-            st.session_state.nav=label;st.rerun()
+        if st.button(f"{ico} {name}",use_container_width=True,key="nav"+name):st.session_state.nav=name;st.rerun()
 
-# ---------- shared filters ----------
-def current_filtered():
-    arr=[]
-    kw=st.session_state.keyword.strip().lower()
+def filtered():
+    out=[]; kw=st.session_state.keyword.strip().lower()
     for n in st.session_state.notices:
-        d,days,status=deadline_info(n)
-        if status=="Abgelaufen": continue
-        if st.session_state.hide_unknown_deadline and days is None: continue
-        if days is not None and days<st.session_state.min_days:continue
-        if st.session_state.only_supplies and contract_kind(n)!="Lieferung":continue
-        score,_,_=score_notice(n,st.session_state.capital,st.session_state.reserve,st.session_state.target_margin)
-        if score<st.session_state.min_score:continue
-        if kw and kw not in all_text(n).lower():continue
-        arr.append(n)
-    return sorted(arr,key=lambda x:score_notice(x,st.session_state.capital,st.session_state.reserve,st.session_state.target_margin)[0],reverse=True)
+        ok,_=hard_validate(n,st.session_state.max_age,st.session_state.strict_deadline)
+        if not ok:continue
+        d=deadline(n); days=(d-TODAY).days if d else 999
+        if days<st.session_state.min_days:continue
+        if kw and kw not in text(n).lower():continue
+        sc,gr,_=score(n,st.session_state.capital,st.session_state.reserve,st.session_state.margin)
+        if sc<st.session_state.min_score:continue
+        out.append(n)
+    return sorted(out,key=lambda n:(publication_date(n) or date(1900,1,1),score(n,st.session_state.capital,st.session_state.reserve,st.session_state.margin)[0]),reverse=True)
 
-def render_deal_card(n,idx):
-    pub=first_scalar(n.get("publication-number"),"—"); title=first_scalar(n.get("notice-title"),"Ohne Titel"); buyer=first_scalar(n.get("buyer-name"),"—")
-    score,reasons,grade=score_notice(n,st.session_state.capital,st.session_state.reserve,st.session_state.target_margin)
-    d,days,status=deadline_info(n); fin=deal_finance(n,st.session_state.capital,st.session_state.reserve,st.session_state.target_margin)
-    cls="good" if grade=="GO" else "warn" if grade=="PRÜFEN" else "bad"
-    deadline_txt=(f"{d.strftime('%d.%m.%Y')} · {days} Tage" if d else "nicht strukturiert angegeben")
-    st.markdown(f'''<div class="card deal {cls}"><span class="badge {cls}">{grade} · {score}/100</span><span class="badge">{contract_kind(n)}</span><span class="badge">TED {pub}</span><h3 style="margin:.55rem 0 .25rem">{title}</h3><div class="muted">{buyer}</div><div class="divider"></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px"><div><div class="label">Frist</div><div class="value">{deadline_txt}</div></div><div><div class="label">Volumen</div><div class="value">{money(fin['revenue'],fin['currency']) if fin['revenue'] else 'nicht veröffentlicht'}</div></div><div><div class="label">Finanzierungslücke*</div><div class="value">{money(fin['gap'],fin['currency']) if fin['gap'] is not None else 'nicht berechenbar'}</div></div></div></div>''',unsafe_allow_html=True)
-    c1,c2,c3=st.columns([1.25,1,1])
-    with c1:
-        if st.button("Deal-Akte öffnen",key=f"open{idx}_{pub}",use_container_width=True):st.session_state.selected=n;st.session_state.nav="Deal-Akte";st.rerun()
-    with c2:
-        if st.button("★ Merken" if not watched(pub) else "✓ Gemerkt",key=f"watch{idx}_{pub}",use_container_width=True):watch_add(n);st.toast("Zur Watchlist hinzugefügt")
-    with c3:st.link_button("TED Original",notice_url(pub),use_container_width=True)
+def card(n,i):
+    pub=first(n.get("publication-number")); title=first(n.get("notice-title"),"Ohne Titel"); buyer=first(n.get("buyer-name")); sc,gr,reasons=score(n,st.session_state.capital,st.session_state.reserve,st.session_state.margin); d=deadline(n); val,cur,src=value_info(n)
+    cls="good" if gr=="GO" else "warn" if gr=="PRÜFEN" else "bad"; bcls="bg" if gr=="GO" else "bw" if gr=="PRÜFEN" else "bb"
+    days=(d-TODAY).days if d else None
+    st.markdown(f'''<div class="card {cls}"><span class="badge {bcls}">{gr} · {sc}/100</span><span class="badge">{nature(n)}</span><span class="badge gold">{publication_date(n).strftime('%d.%m.%Y') if publication_date(n) else '—'}</span><h3 style="margin:.55rem 0 .25rem">{title}</h3><div class="muted">{buyer}</div><div class="divider"></div><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px"><div><div class="label">Frist</div><div class="value">{d.strftime('%d.%m.%Y') if d else '—'}{f' · {days} Tage' if days is not None else ''}</div></div><div><div class="label">Volumen</div><div class="value">{money(val,cur)}</div></div><div><div class="label">CPV</div><div class="value">{first(n.get('classification-cpv'),'—')}</div></div></div></div>''',unsafe_allow_html=True)
+    a,b,c=st.columns([1.2,1,1])
+    with a:
+        if st.button("Deal-Akte öffnen",key=f"open{i}{pub}",use_container_width=True):st.session_state.selected=n;st.session_state.nav="Deal-Akte";st.rerun()
+    with b:
+        if st.button("✓ Gemerkt" if is_watched(pub) else "★ Merken",key=f"wat{i}{pub}",use_container_width=True):add_watch(n);st.toast("Gespeichert")
+    with c:st.link_button("TED Original",f"https://ted.europa.eu/de/notice/-/detail/{pub}",use_container_width=True)
 
-# ---------- pages ----------
 if st.session_state.nav=="Dashboard":
-    st.markdown('<div class="hero"><h1>Deine Ausschreibungen. Als Deals gedacht.</h1><p>Nicht möglichst viele Treffer — sondern offene Warenaufträge, die zu Kapital, Marge und Beschaffbarkeit passen.</p></div>',unsafe_allow_html=True)
-    filtered=current_filtered(); total=len(st.session_state.notices); gos=sum(1 for n in filtered if score_notice(n,st.session_state.capital,st.session_state.reserve,st.session_state.target_margin)[2]=="GO")
-    with db() as con:wcount=con.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0]
-    cols=st.columns(4)
-    vals=[("Geladen",str(total),"aus letztem Scan"),("Passend",str(len(filtered)),"nach deinen Filtern"),("GO-Chancen",str(gos),"Score ≥ 72"),("Watchlist",str(wcount),"gespeicherte Deals")]
-    for c,(a,b,s) in zip(cols,vals):
-        with c:st.markdown(f'<div class="kpi"><div class="kpi-label">{a}</div><div class="kpi-value">{b}</div><div class="kpi-sub">{s}</div></div>',unsafe_allow_html=True)
-    st.subheader("Top-Chancen")
-    if not st.session_state.notices:
-        st.info("Noch kein Live-Scan in dieser Sitzung. Öffne **Scanner** und tippe auf **Deutschland jetzt scannen**.")
-    else:
-        for i,n in enumerate(filtered[:5]):render_deal_card(n,i)
-    st.caption("* Finanzierungslücke basiert nur auf veröffentlichtem Schätzwert und deiner Zielmarge. Kein veröffentlichter Wert = keine erfundene Kalkulation.")
+    st.markdown('<div class="hero"><h1>Aktuelle Beschaffungschancen statt Archivtreffer.</h1><p>Nur frische deutsche Waren-Ausschreibungen mit offener Angebotsfrist. Alte Jahre und abgelaufene Fristen werden hart verworfen.</p></div>',unsafe_allow_html=True)
+    f=filtered()
+    with db() as con:w=con.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0]
+    metrics=[("Aktuell geladen",len(st.session_state.notices),"letzter Live-Scan"),("Offen & passend",len(f),"nach Hartfiltern"),("GO-Chancen",sum(score(n,st.session_state.capital,st.session_state.reserve,st.session_state.margin)[1]=="GO" for n in f),"Score ≥ 72"),("Watchlist",w,"gespeichert")]
+    cs=st.columns(4)
+    for c,(lab,val,sub) in zip(cs,metrics):
+        with c:st.markdown(f'<div class="kpi"><div class="kl">{lab}</div><div class="kv">{val}</div><div class="ks">{sub}</div></div>',unsafe_allow_html=True)
+    st.subheader("Neueste Chancen")
+    if not f:st.info("Noch keine aktuellen Treffer geladen. Gehe auf **Scanner** und starte einen Live-Scan.")
+    for i,n in enumerate(f[:8]):card(n,i)
 
 elif st.session_state.nav=="Scanner":
-    st.markdown('<div class="hero"><h1>Live-Scanner</h1><p>Nur TED-Scope ACTIVE. Abgelaufene Fristen werden zusätzlich lokal entfernt. Die API fällt bei Feldänderungen automatisch auf einen stabileren Datensatz zurück.</p></div>',unsafe_allow_html=True)
-    a,b,c=st.columns([1,1,1])
-    with a: st.session_state.scan_limit=st.selectbox("Abrufmenge",[25,50,100,150,200],index=[25,50,100,150,200].index(st.session_state.scan_limit) if st.session_state.scan_limit in [25,50,100,150,200] else 2)
-    with b: st.session_state.only_supplies=st.toggle("Nur Waren/Lieferungen",value=st.session_state.only_supplies)
-    with c: st.session_state.hide_unknown_deadline=st.toggle("Unbekannte Frist ausblenden",value=st.session_state.hide_unknown_deadline)
-    if st.button("🚀 Deutschland jetzt scannen",type="primary",use_container_width=True):
+    st.markdown('<div class="hero"><h1>Live-Scanner</h1><p>Aktive TED-Daten + zusätzlicher Veröffentlichungszeitraum + offene Angebotsfrist + Warenfilter. Dadurch können 2016er Archivtreffer nicht mehr durchrutschen.</p></div>',unsafe_allow_html=True)
+    c1,c2,c3=st.columns(3)
+    with c1:st.session_state.max_age=st.selectbox("Nur veröffentlicht in den letzten",[30,60,90,120,180],index=[30,60,90,120,180].index(st.session_state.max_age) if st.session_state.max_age in [30,60,90,120,180] else 3,format_func=lambda x:f"{x} Tagen")
+    with c2:st.session_state.scan_limit=st.selectbox("Abrufmenge",[25,50,75,100],index=[25,50,75,100].index(st.session_state.scan_limit))
+    with c3:st.session_state.strict_deadline=st.toggle("Nur mit offener Angebotsfrist",value=st.session_state.strict_deadline)
+    live_kw=st.text_input("Live-Suchbegriff (optional)",placeholder="z. B. Werkzeug, Kabel, Toner, Ersatzteile")
+    if st.button("🚀 Aktuelle deutsche Waren-Ausschreibungen laden",type="primary",use_container_width=True):
         with st.spinner("TED wird live abgefragt …"):
             try:
-                notices,meta,errs,used=scan_ted(st.session_state.scan_limit)
-                st.session_state.notices=notices;st.session_state.scan_error=None;st.session_state.last_scan=datetime.now().strftime("%d.%m.%Y %H:%M")
-                st.success(f"{len(notices)} aktive TED-Bekanntmachungen geladen · API-Felder: {len(used)}")
-                if errs:st.caption("Fallback wurde verwendet. Die App hat eine ungültige optionale Feldgruppe automatisch übersprungen.")
+                raw,meta,q=ted_search(st.session_state.scan_limit,st.session_state.max_age,live_kw)
+                cleaned=[]; rejected={}
+                for n in raw:
+                    ok,why=hard_validate(n,st.session_state.max_age,st.session_state.strict_deadline)
+                    if ok:cleaned.append(n)
+                    else:rejected[why]=rejected.get(why,0)+1
+                st.session_state.notices=cleaned;st.session_state.last_scan=datetime.now().strftime("%d.%m.%Y %H:%M");st.session_state.scan_error=None
+                st.success(f"{len(cleaned)} aktuelle offene Waren-Ausschreibungen geladen. {len(raw)-len(cleaned)} irrelevante/alte Treffer verworfen.")
+                with st.expander("Scan-Details"):
+                    st.code(q);st.write("Verworfen:",rejected)
             except Exception as e:
-                st.session_state.scan_error=str(e);st.error("TED konnte nicht geladen werden. Öffne unten die Diagnose — die App zeigt jetzt die echte Servermeldung statt nur ‘400 Bad Request’.")
+                st.session_state.scan_error=str(e);st.error("TED-Live-Scan fehlgeschlagen. Die genaue Servermeldung steht unten.")
     if st.session_state.scan_error:
-        with st.expander("API-Diagnose"):
-            st.code(st.session_state.scan_error)
-            st.caption("Die Abfrage verwendet buyer-country=DEU, scope=ACTIVE und PAGE_NUMBER. Falls TED die Feldliste ändert, wird automatisch zweimal reduziert.")
-    st.markdown("### Suchfilter")
+        with st.expander("API-Diagnose",expanded=True):st.code(st.session_state.scan_error)
+    st.markdown("### Ergebnisfilter")
     q1,q2,q3=st.columns([2,1,1])
-    with q1:st.session_state.keyword=st.text_input("Produkt / Auftraggeber / CPV / Stichwort",value=st.session_state.keyword,placeholder="z. B. Kabel, Werkzeug, Drucker, Ersatzteile")
-    with q2:st.session_state.min_days=st.number_input("Mind. Resttage",min_value=0,max_value=180,value=int(st.session_state.min_days))
-    with q3:st.session_state.min_score=st.slider("Mind. Score",0,100,int(st.session_state.min_score),5)
-    filtered=current_filtered();st.markdown(f"### {len(filtered)} passende Ausschreibungen")
-    if st.session_state.last_scan:st.caption(f"Letzter Scan: {st.session_state.last_scan}")
-    for i,n in enumerate(filtered):render_deal_card(n,1000+i)
+    with q1:st.session_state.keyword=st.text_input("In geladenen Treffern suchen",value=st.session_state.keyword,placeholder="Produkt, Auftraggeber, CPV …")
+    with q2:st.session_state.min_days=st.number_input("Mind. Resttage",0,180,int(st.session_state.min_days))
+    with q3:st.session_state.min_score=st.slider("Mind. Deal-Score",0,100,int(st.session_state.min_score),5)
+    f=filtered();st.markdown(f"### {len(f)} passende aktuelle Ausschreibungen")
+    if st.session_state.last_scan:st.caption("Letzter Scan: "+st.session_state.last_scan)
+    for i,n in enumerate(f):card(n,1000+i)
 
 elif st.session_state.nav=="Deal-Akte":
     n=st.session_state.selected
-    if not n:
-        st.info("Öffne im Scanner oder Dashboard zuerst eine Ausschreibung.")
+    if not n:st.info("Öffne zuerst im Scanner eine Ausschreibung.")
     else:
-        pub=first_scalar(n.get("publication-number"),"—")
-        # refresh single detail if current payload is core/minimal
-        if not n.get("description-proc") and not n.get("description-lot"):
-            detail,err=fetch_detail(pub)
-            if detail:
-                merged=n.copy();merged.update(detail);n=merged;st.session_state.selected=n
-        title=first_scalar(n.get("notice-title"),"Ohne Titel");buyer=first_scalar(n.get("buyer-name"),"—");intel=extract_product_intel(n);score,reasons,grade=score_notice(n,st.session_state.capital,st.session_state.reserve,st.session_state.target_margin);fin=deal_finance(n,st.session_state.capital,st.session_state.reserve,st.session_state.target_margin);d,days,status=deadline_info(n)
-        st.markdown(f'<div class="hero"><span class="badge gold">TED {pub}</span><span class="badge">{contract_kind(n)}</span><h1>{title}</h1><p>{buyer}</p></div>',unsafe_allow_html=True)
-        k=st.columns(4)
-        metrics=[("Deal-Score",f"{score}/100",grade),("Angebotsfrist",d.strftime("%d.%m.%Y") if d else "unbekannt",f"{days} Tage" if days is not None else "prüfen"),("Ausschreibungswert",money(fin['revenue'],fin['currency']) if fin['revenue'] else "nicht veröffentlicht",fin['source']),("Kapitalbedarf*",money(fin['max_buy'],fin['currency']) if fin['max_buy'] is not None else "nicht berechenbar",f"Lücke {money(fin['gap'],fin['currency'])}" if fin['gap'] is not None else "")]
-        for c,(lab,val,sub) in zip(k,metrics):
-            with c:st.metric(lab,val,sub)
-        tabs=st.tabs(["📦 Produkt","💶 Umsatz & Kapital","🏭 Beschaffung","✅ Anforderungen","📄 Original","📝 Lieferantenangebote"])
+        pub=first(n.get("publication-number")); title=first(n.get("notice-title"),"Ohne Titel"); buyer=first(n.get("buyer-name")); d=deadline(n); val,cur,src=value_info(n); sc,gr,reasons=score(n,st.session_state.capital,st.session_state.reserve,st.session_state.margin); usable=max(0,st.session_state.capital-st.session_state.reserve); max_buy=val*(1-st.session_state.margin/100) if val else None; gap=max(0,max_buy-usable) if max_buy is not None else None
+        st.markdown(f'<div class="hero"><span class="badge gold">TED {pub}</span><span class="badge">{nature(n)}</span><h1>{title}</h1><p>{buyer}</p></div>',unsafe_allow_html=True)
+        m=st.columns(4);m[0].metric("Deal-Score",f"{sc}/100",gr);m[1].metric("Angebotsfrist",d.strftime("%d.%m.%Y") if d else "—",f"{(d-TODAY).days} Tage" if d else "");m[2].metric("Veröff. Volumen",money(val,cur),src);m[3].metric("Finanzierungslücke*",money(gap,cur) if gap is not None else "—")
+        tabs=st.tabs(["📦 Produkt & Menge","📄 Unterlagen analysieren","💶 Kalkulation","🏭 Beschaffung","✅ Risiken","🔗 Original"])
         with tabs[0]:
-            st.subheader("Was wird beschafft?")
-            st.markdown(f"**Produkt-/Leistungstitel:** {intel['title']}")
-            if intel["quantities"]:st.markdown("**Erkannte Mengen:** "+" · ".join(intel["quantities"]))
-            else:st.warning("Keine belastbare Stückzahl im veröffentlichten TED-Text erkannt. Die App erfindet keine Menge.")
-            if intel["articles"]:st.markdown("**Artikel / Modell / Typ:** "+" · ".join(intel["articles"]))
-            else:st.info("Keine eindeutige Artikel-/Modellnummer in der Bekanntmachung erkannt.")
-            if intel["cpv"]:st.markdown("**CPV:** "+", ".join(intel["cpv"]))
-            st.markdown("**Veröffentlichte Beschreibung**")
-            st.write(intel["description"] or "Keine Detailbeschreibung als strukturiertes TED-Feld verfügbar. Öffne die Originalunterlagen.")
+            intel=product_intel(n)
+            st.markdown(f"**Beschaffungsgegenstand:** {intel['title']}")
+            st.markdown("**CPV:** "+(", ".join(intel["cpv"]) if intel["cpv"] else "nicht angegeben"))
+            st.write("**Mengen erkannt:**",", ".join(intel["quantities"]) if intel["quantities"] else "In den TED-Kerndaten nicht enthalten – Unterlagen analysieren.")
+            st.write("**Artikel / Typ / Modell erkannt:**",", ".join(intel["articles"]) if intel["articles"] else "Nicht in den TED-Kerndaten enthalten.")
         with tabs[1]:
-            st.subheader("Deal-Kalkulation")
-            if fin["revenue"]:
-                st.info("Der TED-Wert ist ein veröffentlichter Schätz-/Loswert. Bei Rahmenvereinbarungen ist er **kein garantierter Umsatz**.")
-                c1,c2,c3,c4=st.columns(4)
-                c1.metric("Theoretisches Volumen",money(fin["revenue"],fin["currency"]))
-                c2.metric("Max. Einkauf bei Zielmarge",money(fin["max_buy"],fin["currency"]))
-                c3.metric("Rohertragsziel",money(fin["gross"],fin["currency"]))
-                c4.metric("Finanzierungslücke",money(fin["gap"],fin["currency"]))
-            else:st.warning("TED veröffentlicht für diese Bekanntmachung keinen belastbaren Wert. Umsatz wird deshalb nicht geschätzt.")
-            st.markdown("**Warum dieser Score?**")
-            for r in reasons:st.write("• "+r)
+            st.subheader("Originalunterlagen / Leistungsbeschreibung")
+            st.caption("Hier bekommst du die genaue Produkt-/Mengenanalyse, wenn TED selbst nur den Titel veröffentlicht.")
+            uploaded=st.file_uploader("PDF-Leistungsbeschreibung hochladen",type=["pdf"],key="pdfdoc")
+            extra=""
+            if uploaded:
+                extra=pdf_text(uploaded)
+                if extra:
+                    intel=product_intel(n,extra)
+                    st.success(f"PDF gelesen · {len(extra):,} Zeichen".replace(",","."))
+                    c1,c2=st.columns(2)
+                    with c1:
+                        st.markdown("**Erkannte Mengen**")
+                        st.write("\n".join("• "+x for x in intel["quantities"]) if intel["quantities"] else "Keine eindeutige Menge erkannt")
+                    with c2:
+                        st.markdown("**Erkannte Artikel / Typen**")
+                        st.write("\n".join("• "+x for x in intel["articles"]) if intel["articles"] else "Keine eindeutige Artikelnummer erkannt")
+                    with st.expander("Extrahierter Dokumenttext"):st.text(extra[:30000])
+            if st.button("TED-HTML automatisch einlesen",use_container_width=True):
+                htmltxt,err=fetch_ted_html(pub)
+                if err:st.warning("TED-HTML konnte nicht automatisch gelesen werden: "+err)
+                else:
+                    st.session_state["html_"+pub]=htmltxt;st.success("TED-HTML geladen")
+            htmltxt=st.session_state.get("html_"+pub,"")
+            if htmltxt:
+                intel=product_intel(n,htmltxt)
+                st.write("**Mengen aus TED-HTML:**",", ".join(intel["quantities"]) if intel["quantities"] else "keine erkannt")
+                st.write("**Artikel/Typ aus TED-HTML:**",", ".join(intel["articles"]) if intel["articles"] else "keine erkannt")
         with tabs[2]:
-            if safety_flags((intel["title"]+" "+intel["description"])):
-                st.error("Beschaffungssuche deaktiviert: regulierte/ausgeschlossene Güter erkannt.")
-            else:
-                st.subheader("Bezugsquellen recherchieren")
-                st.caption("Diese Buttons starten eine gezielte Lieferantensuche. Preise werden erst als ‘echt’ behandelt, wenn du ein Angebot einträgst.")
-                sources=procurement_queries(n)
-                cols=st.columns(2)
-                for i,(name,url) in enumerate(sources):
-                    with cols[i%2]:st.link_button(f"↗ {name}",url,use_container_width=True)
-                st.markdown("#### Anfrage an Lieferanten")
-                st.code(f"Betreff: Angebotsanfrage – {intel['title'][:90]}\n\nGuten Tag,\nbitte senden Sie uns Ihr bestes B2B-Angebot für die nachfolgende Position inkl. Lieferzeit, Versand, Zahlungsziel und Gültigkeit.\n\nProdukt: {intel['title']}\nMenge: {', '.join(intel['quantities']) if intel['quantities'] else '[laut Vergabeunterlagen]'}\nArtikel/Typ: {', '.join(intel['articles']) if intel['articles'] else '[falls spezifiziert]'}\n\nBitte bestätigen Sie außerdem die technische Gleichwertigkeit zur geforderten Spezifikation.",language=None)
+            st.info("Der veröffentlichte Auftragswert ist kein garantierter Umsatz. Für Rahmenverträge kann er nur eine Obergrenze/Schätzung sein.")
+            c1,c2,c3=st.columns(3);c1.metric("Theoretisches Volumen",money(val,cur));c2.metric("Max. Einkauf bei Zielmarge",money(max_buy,cur) if max_buy is not None else "—");c3.metric("Eigenkapital verfügbar",money(usable))
+            if gap is not None:
+                (st.success if gap<=0 else st.warning)("Aus Eigenkapital finanzierbar." if gap<=0 else f"Vorfinanzierungslücke: {money(gap,cur)}")
+            st.markdown("**Score-Gründe**")
+            for r in reasons:st.write("• "+r)
         with tabs[3]:
-            st.subheader("Prüfmatrix")
-            reqtext=intel["description"].lower()
-            checks=[("Frist belastbar",d is not None),("Wert veröffentlicht",fin["revenue"] is not None),("Menge erkannt",bool(intel["quantities"])),("Artikel/Typ erkannt",bool(intel["articles"])),("Keine regulierten Güter",not safety_flags(reqtext+" "+intel["title"].lower())),("Keine offensichtliche Sicherheitsanforderung",not any(x in reqtext for x in HARD))]
-            for lab,ok in checks:st.write(("✅" if ok else "⚠️")+" "+lab)
-            criteria=all_text(n.get("selection-criterion-name-lot"))+" "+all_text(n.get("selection-criterion-description-lot"))
-            if criteria:st.markdown("**Eignungs-/Auswahlkriterien**");st.write(criteria[:5000])
-            else:st.info("Keine Eignungskriterien im geladenen strukturierten Feld. Originalunterlagen prüfen.")
+            intel=product_intel(n); q=urllib.parse.quote_plus((intel["articles"][0] if intel["articles"] else intel["title"])[:130])
+            sources=[("Google B2B",f"https://www.google.com/search?q={q}+Gro%C3%9Fhandel+B2B+Deutschland"),("Unite/Mercateo",f"https://www.google.com/search?q=site%3Aunite.eu+{q}"),("RS",f"https://www.google.com/search?q=site%3Ade.rs-online.com+{q}"),("Conrad",f"https://www.google.com/search?q=site%3Aconrad.de+{q}"),("Farnell",f"https://www.google.com/search?q=site%3Ade.farnell.com+{q}"),("Distrelec",f"https://www.google.com/search?q=site%3Adistrelec.de+{q}"),("Würth",f"https://www.google.com/search?q=site%3Awuerth.de+{q}")]
+            cs=st.columns(2)
+            for i,(name,url) in enumerate(sources):
+                with cs[i%2]:st.link_button("↗ "+name,url,use_container_width=True)
+            st.caption("Das sind Recherchewege, keine bestätigten Preise. Einen Preis erst als echt behandeln, wenn ein Lieferantenangebot vorliegt.")
         with tabs[4]:
-            st.link_button("TED Originalbekanntmachung öffnen",notice_url(pub),use_container_width=True)
-            sub=first_scalar(n.get("submission-url-lot"),"")
-            if sub and sub!="—":st.link_button("Vergabe-/Einreichungsportal öffnen",sub,use_container_width=True)
+            intel=product_intel(n); low=intel["blob"].lower()
+            checks=[("Aktuelle Veröffentlichung",publication_date(n) and publication_date(n)>=TODAY-timedelta(days=st.session_state.max_age)),("Offene Angebotsfrist",d is not None and d>=TODAY),("Lieferauftrag",nature(n)=="Lieferung"),("Keine regulierten Güter",not any(x in low for x in BLOCKED)),("Wert veröffentlicht",val is not None),("Menge bekannt",bool(intel["quantities"]))]
+            for lab,ok in checks:st.write(("✅ " if ok else "⚠️ ")+lab)
+        with tabs[5]:
+            st.link_button("TED Original öffnen",f"https://ted.europa.eu/de/notice/-/detail/{pub}",use_container_width=True)
             links=n.get("links")
             if links:st.json(links,expanded=False)
-            st.caption("Die Leistungsbeschreibung kann außerhalb von TED auf einem nationalen Vergabeportal liegen. Tender Scout zeigt nur Daten als sicher an, die tatsächlich geladen wurden.")
-        with tabs[5]:
-            st.subheader("Echte Einkaufspreise hinterlegen")
-            with st.form("quote_form"):
-                supplier=st.text_input("Lieferant")
-                qbuy=st.number_input("Waren-Einkauf netto",0.0,1e9,0.0,step=10.0)
-                ship=st.number_input("Versand / Nebenkosten netto",0.0,1e9,0.0,step=10.0)
-                sell=st.number_input("Geplanter Verkauf netto",0.0,1e9,float(fin['revenue'] or 0),step=10.0)
-                note=st.text_area("Notiz / Lieferzeit / Zahlungsziel")
-                if st.form_submit_button("Angebot speichern",use_container_width=True) and supplier:
-                    save_quote(pub,supplier,qbuy,ship,sell,note);st.success("Gespeichert")
-            qdf=load_quotes(pub)
-            if not qdf.empty:
-                qdf["DB €"]=qdf["sell_price"]-qdf["buy_price"]-qdf["shipping"]
-                qdf["DB %"]=(qdf["DB €"]/qdf["sell_price"].replace(0,float("nan"))*100).round(1)
-                st.dataframe(qdf,use_container_width=True,hide_index=True)
-        st.markdown("---")
-        wc1,wc2=st.columns(2)
-        with wc1:
-            if watched(pub):
-                if st.button("Von Watchlist entfernen",use_container_width=True):watch_remove(pub);st.rerun()
-            else:
-                if st.button("★ Zur Watchlist",type="primary",use_container_width=True):watch_add(n);st.rerun()
-        with wc2:st.link_button("↗ TED öffnen",notice_url(pub),use_container_width=True)
-        st.caption("* Kapitalbedarf = veröffentlichter Wert × (1 − Zielmarge). Das ist ein Filter, kein echter Einkaufspreis. Echte Preise entstehen erst aus Lieferantenangeboten.")
+        st.caption("*Kapitalbedarf ist nur ein Filter aus publiziertem Wert und Zielmarge, kein echter Einkaufspreis.")
 
 elif st.session_state.nav=="Watchlist":
-    st.markdown('<div class="hero"><h1>Watchlist</h1><p>Deine vorgemerkten Chancen und Lieferantenkalkulationen.</p></div>',unsafe_allow_html=True)
-    with db() as con:rows=con.execute("SELECT pub,title,buyer,note,added,payload FROM watchlist ORDER BY added DESC").fetchall()
-    if not rows:st.info("Noch nichts gemerkt.")
-    for i,(pub,title,buyer,note,added,payload) in enumerate(rows):
-        n=json.loads(payload);render_deal_card(n,3000+i)
+    st.markdown('<div class="hero"><h1>Watchlist</h1><p>Deine gespeicherten Chancen.</p></div>',unsafe_allow_html=True)
+    with db() as con:rows=con.execute("SELECT pub,title,buyer,added,payload FROM watchlist ORDER BY added DESC").fetchall()
+    if not rows:st.info("Noch nichts gespeichert.")
+    for i,(_,_,_,_,payload) in enumerate(rows):card(json.loads(payload),3000+i)
 
 elif st.session_state.nav=="Kalkulator":
-    st.markdown('<div class="hero"><h1>Angebots-Kalkulator</h1><p>Vom echten Einkaufspreis zu deinem Mindestverkaufspreis und Deckungsbeitrag.</p></div>',unsafe_allow_html=True)
+    st.markdown('<div class="hero"><h1>Angebots-Kalkulator</h1><p>Mit echten Lieferantenpreisen kalkulieren.</p></div>',unsafe_allow_html=True)
     c1,c2=st.columns(2)
-    with c1:
-        buy=st.number_input("Wareneinkauf netto",0.0,1e9,1500.0,step=50.0)
-        shipping=st.number_input("Fracht / Verpackung",0.0,1e9,80.0,step=10.0)
-        other=st.number_input("Sonstige direkte Kosten",0.0,1e9,50.0,step=10.0)
-    with c2:
-        target=st.number_input("Ziel-DB in % vom Verkauf",1.0,80.0,float(st.session_state.target_margin),step=1.0)
-        vat=st.number_input("USt. % (nur Anzeige)",0.0,30.0,19.0,step=1.0)
-        payment_days=st.number_input("Erwartetes Zahlungsziel (Tage)",0,180,30)
-    cost=buy+shipping+other
-    sell=cost/(1-target/100) if target<100 else 0
-    dbv=sell-cost
-    cols=st.columns(4);cols[0].metric("Gesamtkosten",money(cost));cols[1].metric("Mindestverkauf netto",money(sell));cols[2].metric("Deckungsbeitrag",money(dbv));cols[3].metric("Brutto-Rechnung",money(sell*(1+vat/100)))
-    usable=max(0,st.session_state.capital-st.session_state.reserve)
-    if cost<=usable:st.success(f"Mit deiner aktuellen Liquiditätsreserve finanzierbar. Puffer: {money(usable-cost)}")
-    else:st.warning(f"Finanzierungslücke vor Zahlung des Kunden: {money(cost-usable)}")
+    with c1:buy=st.number_input("Wareneinkauf netto",0.0,1e9,1500.0,50.0);shipping=st.number_input("Fracht / Verpackung",0.0,1e9,80.0,10.0);other=st.number_input("Sonstige direkte Kosten",0.0,1e9,50.0,10.0)
+    with c2:target=st.number_input("Ziel-DB % vom Verkauf",1.0,80.0,float(st.session_state.margin),1.0);vat=st.number_input("USt. %",0.0,30.0,19.0,1.0)
+    cost=buy+shipping+other;sell=cost/(1-target/100);gross=sell-cost
+    cs=st.columns(4);cs[0].metric("Kosten",money(cost));cs[1].metric("Mindestverkauf netto",money(sell));cs[2].metric("Deckungsbeitrag",money(gross));cs[3].metric("Brutto-Rechnung",money(sell*(1+vat/100)))
 
 elif st.session_state.nav=="Einstellungen":
-    st.markdown('<div class="hero"><h1>Einstellungen</h1><p>Dein persönlicher Deal-Filter. Änderungen wirken sofort auf Scores und Kapitalprüfung.</p></div>',unsafe_allow_html=True)
-    st.session_state.capital=st.number_input("Verfügbares Geschäftskapital (€)",0.0,1e7,float(st.session_state.capital),step=100.0)
-    st.session_state.reserve=st.number_input("Davon Sicherheitsreserve (€)",0.0,float(st.session_state.capital),min(float(st.session_state.reserve),float(st.session_state.capital)),step=100.0)
-    st.session_state.target_margin=st.slider("Zielmarge / DB-Filter (%)",5,60,int(st.session_state.target_margin),1)
-    st.info(f"Für Waren reserviert Tender Scout aktuell maximal **{money(max(0,st.session_state.capital-st.session_state.reserve))}** Eigenkapital.")
-    st.markdown("### Datensicherung")
-    with db() as con:
-        w=pd.read_sql_query("SELECT * FROM watchlist",con);q=pd.read_sql_query("SELECT * FROM quotes",con)
-    backup=json.dumps({"watchlist":w.to_dict(orient="records"),"quotes":q.to_dict(orient="records"),"exported":datetime.now().isoformat()},ensure_ascii=False,indent=2)
-    st.download_button("Backup herunterladen",backup,file_name="tender_scout_backup.json",mime="application/json",use_container_width=True)
-    st.warning("Streamlit Community Cloud kann lokale Dateien bei Neustarts zurücksetzen. Für langfristig garantiert persistente Daten sollte später eine Cloud-Datenbank (z. B. Supabase/Postgres) verbunden werden.")
-    st.caption(f"Tender Scout Pro · {APP_VERSION}")
+    st.markdown('<div class="hero"><h1>Einstellungen</h1><p>Dein Geschäftsprofil für den Deal-Score.</p></div>',unsafe_allow_html=True)
+    st.session_state.capital=st.number_input("Geschäftskapital (€)",0.0,1e7,float(st.session_state.capital),100.0)
+    st.session_state.reserve=st.number_input("Sicherheitsreserve (€)",0.0,float(st.session_state.capital),min(float(st.session_state.reserve),float(st.session_state.capital)),100.0)
+    st.session_state.margin=st.slider("Zielmarge / Deckungsbeitrag (%)",5,60,int(st.session_state.margin),1)
+    st.info(f"Für Wareneinkauf verfügbar: **{money(max(0,st.session_state.capital-st.session_state.reserve))}**")
+    st.caption("Tender Scout Pro · "+APP_VERSION)
